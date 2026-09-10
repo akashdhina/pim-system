@@ -1,0 +1,46 @@
+﻿# Dependencies and builds
+/node_modules/
+/.next/
+/out/
+
+# Environment and secrets
+/.env
+/.env.local
+/.env.production
+/.env.*.local
+
+# Live database files
+/database/*.db
+/database/*.scratch.db
+/database/*.db-wal
+/database/*.db-shm
+/database/*.db-journal
+
+# Case documents and backups
+/storage/
+/backups/
+/recovery/
+/documents/generated/
+
+# Runtime files
+logs/
+*.log
+/pim-server.pid
+/pim-tunnel.pid
+/tools/
+
+# Temporary and test files
+/tmp/
+/temp/
+*-test-output.docx
+*.generated.docx
+*.generated.pdf
+/check-*.js
+/verify-*.js
+/repair-*.js
+
+# Windows/editor files
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
