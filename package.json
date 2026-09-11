@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:auth-lan": "node scripts/test-auth-lan-http.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

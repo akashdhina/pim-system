@@ -16,6 +16,16 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Office LAN Production
+
+For a trusted office LAN deployment that runs the production server over plain HTTP, set this local-only environment variable in `.env.local`:
+
+```env
+PIM_ALLOW_HTTP_LAN=1
+```
+
+Use this only when access is restricted to the office subnet, for example by Windows Firewall. Without this opt-in, production session cookies include `Secure` and require HTTPS.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
