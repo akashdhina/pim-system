@@ -10,6 +10,13 @@ const {
 const {
   officeDate,
 } = require("../../../../lib/pim-time");
+const {
+  listMediators,
+} = require("../../../../lib/pim-data/mediators");
+const {
+  checkDuplicateActiveEnrollmentPg,
+  createMediatorPg,
+} = require("../../../../lib/pim-data/mediator-registry");
 
 function positiveInt(value, fallback, max = 100) {
   const number = Number(value);
@@ -98,10 +105,19 @@ function validateMediatorInput(input, { partial = false } = {}) {
     return "Mediator name is required.";
   }
 
-  if (input.enrollmentNo !== undefined && !input.enrollmentNo) {
-    return "Enrollment number is required.";
+  if (!partial && !input.category) {
+    return "Category is required.";
   }
 
+  if (input.category !== undefined && !input.category) {
+    return "Category is required.";
+  }
+
+  // Batch 5H-a (Phase 6) mediator-panel reconciliation: enrollment number is
+  // NOT a mandatory mediator field (the DB schema has never required it, and
+  // the two real pre-existing mediator records already have enrollment_no
+  // NULL - see docs/phase6-batch5h-mediator-registry-migration.md). It is
+  // validated only when supplied, never required.
   if (!validatePhone(input.contactPhone)) {
     return "Phone number is not valid.";
   }
@@ -129,7 +145,9 @@ function validateMediatorInput(input, { partial = false } = {}) {
   return null;
 }
 
-function duplicateActiveEnrollment(enrollmentNo, exceptId = null) {
+// The ORIGINAL SQLite duplicate-enrollment check, kept unused as an instant rollback.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function duplicateActiveEnrollmentSqlite(enrollmentNo, exceptId = null) {
   if (!enrollmentNo) return null;
 
   return db.prepare(`
@@ -142,6 +160,15 @@ function duplicateActiveEnrollment(enrollmentNo, exceptId = null) {
   `).get(enrollmentNo, exceptId, exceptId);
 }
 
+/*
+ * Batch 1 (Phase 6): the SQLite query builder below is kept, unused by
+ * GET now, purely as an instant rollback - if the PostgreSQL path
+ * (lib/pim-data/mediators.js) needs to be reverted, restoring the three
+ * lines it replaced in GET is a 1-line diff, not a lost-code problem.
+ * Batch 5H migrated POST to PostgreSQL (lib/pim-data/mediator-registry.js);
+ * the SQLite insert logic below is kept as postSqlite, unused, for the
+ * same rollback purpose.
+ */
 function mediatorListQuery(searchParams) {
   const page = positiveInt(searchParams.get("page"), 1, 100000);
   const pageSize = positiveInt(searchParams.get("pageSize"), 20, 100);
@@ -291,33 +318,15 @@ export async function GET(request) {
   try {
     requirePermission(request, "READ_MEDIATOR");
 
+    // Batch 1 (Phase 6): migrated to PostgreSQL via lib/pim-data/mediators.js.
+    // The permission check above is unchanged - still the SQLite-backed
+    // lib/pim-auth.js session/user resolution, run before any data access.
     const url = new URL(request.url);
-    const query = mediatorListQuery(url.searchParams);
-    const total =
-      db.prepare(query.countSql).get(...query.params).count || 0;
-    const rows = db
-      .prepare(query.rowsSql)
-      .all(...query.params, query.pageSize, query.offset);
-    const categories = db.prepare(`
-      SELECT DISTINCT category
-      FROM mediators
-      WHERE category IS NOT NULL
-        AND TRIM(category) <> ''
-      ORDER BY category
-    `).all();
+    const data = await listMediators(url.searchParams);
 
     return Response.json({
       success: true,
-      data: {
-        rows,
-        categories: categories.map((row) => row.category),
-        pagination: {
-          page: query.page,
-          pageSize: query.pageSize,
-          total,
-          totalPages: Math.max(1, Math.ceil(total / query.pageSize)),
-        },
-      },
+      data,
     });
   } catch (error) {
     const authResponse = authErrorResponse(error);
@@ -338,6 +347,79 @@ export async function GET(request) {
   }
 }
 
+/*
+ * The ORIGINAL SQLite POST body, kept unused as an instant rollback and as
+ * the authentic SQLite baseline for scripts/test-pim-mediator-registry-postgres.js
+ * (same convention as app/api/pim/nonstarter/[id]/route.js's
+ * getNonStarterViewSqlite). Not called by POST.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function postMediatorSqlite(input, userId) {
+  const inserted = db.prepare(`
+    INSERT INTO mediators (
+      name,
+      category,
+      enrollment_no,
+      contact_phone,
+      email,
+      empanelment_order_no,
+      empanelment_date,
+      panel_valid_until,
+      active,
+      rotation_order,
+      conflict_declaration_date,
+      remarks
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.name,
+    input.category,
+    input.enrollmentNo,
+    input.contactPhone,
+    input.email,
+    input.empanelmentOrderNo,
+    input.empanelmentDate,
+    input.panelValidUntil,
+    input.active,
+    input.rotationOrder,
+    input.conflictDeclarationDate,
+    input.remarks
+      ? `${input.remarks}\nCreated by user ${userId}.`
+      : `Created by user ${userId}.`
+  );
+  const mediatorId = Number(inserted.lastInsertRowid);
+
+  db.prepare(`
+    INSERT INTO audit_log (
+      table_name,
+      record_id,
+      action,
+      new_value,
+      changed_by,
+      reason
+    )
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    "mediators",
+    mediatorId,
+    "INSERT",
+    JSON.stringify({
+      name: input.name,
+      enrollment_no: input.enrollmentNo,
+      category: input.category,
+      active: input.active,
+    }),
+    userId,
+    "Mediator added through mediator register."
+  );
+
+  return db.prepare(`
+    SELECT *
+    FROM mediators
+    WHERE id = ?
+  `).get(mediatorId);
+}
+
 export async function POST(request) {
   try {
     const user = requirePermission(request, "MANAGE_MEDIATOR");
@@ -347,76 +429,33 @@ export async function POST(request) {
 
     if (error) return validationError(error);
 
-    const duplicate = duplicateActiveEnrollment(input.enrollmentNo);
+    // Batch 5H (Phase 6): migrated to PostgreSQL via lib/pim-data/mediator-registry.js.
+    const duplicate = await checkDuplicateActiveEnrollmentPg(input.enrollmentNo);
     if (duplicate) {
       return conflict(
         `Active mediator with enrollment number ${input.enrollmentNo} already exists.`
       );
     }
 
-    const inserted = db.prepare(`
-      INSERT INTO mediators (
-        name,
-        category,
-        enrollment_no,
-        contact_phone,
-        email,
-        empanelment_order_no,
-        empanelment_date,
-        panel_valid_until,
-        active,
-        rotation_order,
-        conflict_declaration_date,
-        remarks
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      input.name,
-      input.category,
-      input.enrollmentNo,
-      input.contactPhone,
-      input.email,
-      input.empanelmentOrderNo,
-      input.empanelmentDate,
-      input.panelValidUntil,
-      input.active,
-      input.rotationOrder,
-      input.conflictDeclarationDate,
-      input.remarks
-        ? `${input.remarks}\nCreated by user ${user.id}.`
-        : `Created by user ${user.id}.`
-    );
-    const mediatorId = Number(inserted.lastInsertRowid);
-
-    db.prepare(`
-      INSERT INTO audit_log (
-        table_name,
-        record_id,
-        action,
-        new_value,
-        changed_by,
-        reason
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      "mediators",
-      mediatorId,
-      "INSERT",
-      JSON.stringify({
+    const mediator = await createMediatorPg(
+      {
         name: input.name,
-        enrollment_no: input.enrollmentNo,
         category: input.category,
+        enrollment_no: input.enrollmentNo,
+        contact_phone: input.contactPhone,
+        email: input.email,
+        empanelment_order_no: input.empanelmentOrderNo,
+        empanelment_date: input.empanelmentDate,
+        panel_valid_until: input.panelValidUntil,
         active: input.active,
-      }),
-      user.id,
-      "Mediator added through mediator register."
+        rotation_order: input.rotationOrder,
+        conflict_declaration_date: input.conflictDeclarationDate,
+        remarks: input.remarks
+          ? `${input.remarks}\nCreated by user ${user.id}.`
+          : `Created by user ${user.id}.`,
+      },
+      user.id
     );
-
-    const mediator = db.prepare(`
-      SELECT *
-      FROM mediators
-      WHERE id = ?
-    `).get(mediatorId);
 
     return Response.json(
       {

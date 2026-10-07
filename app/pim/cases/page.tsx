@@ -156,9 +156,10 @@ export default function PimCasesPage() {
               options={[
                 ["", "All"],
                 ["SCRUTINY_PENDING", "Scrutiny pending"],
+                ["PIM_NUMBER_PENDING", "PIM number pending"],
                 [
                   "SECRETARY_APPROVAL_PENDING",
-                  "Secretary approval",
+                  "Secretary approval (legacy)",
                 ],
                 ["FORM2_PENDING", "Form-2 pending"],
                 ["SERVICE_PENDING", "Service pending"],

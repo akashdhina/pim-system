@@ -11,8 +11,61 @@ const {
   getCase,
   getActiveNonStarterReasons,
   inferNonStarterContext,
-  recordNonStarter,
+  recordNonStarter, // SQLite version - kept unused by POST as an instant rollback (Batch 5D)
 } = require("../../../../../lib/pim-nonstarter");
+const {
+  recordNonStarterPg,
+} = require("../../../../../lib/pim-data/nonstarter");
+const {
+  getNonStarterViewPg,
+} = require("../../../../../lib/pim-data/nonstarter-read");
+
+/*
+ * Batch 5F (Phase 6): GET below now calls lib/pim-data/nonstarter-read.js
+ * (PostgreSQL). This is the ORIGINAL SQLite GET body, moved verbatim into
+ * a function and kept, unused by GET, purely as an instant rollback (same
+ * convention as app/api/pim/case/[id]/route.js) and as the authentic
+ * SQLite baseline for scripts/test-pim-read-loaders-postgres.js. It
+ * returns null for a missing case, else the object GET puts under `data`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function getNonStarterViewSqlite(caseId) {
+  const caseData = getCase(caseId);
+
+  if (!caseData) {
+    return null;
+  }
+
+  const outcome = db.prepare(`
+    SELECT
+      o.*,
+      nr.code AS nonstarter_reason_code,
+      nr.name AS nonstarter_reason_name,
+      nr.rule_reference,
+      nr.requires_authority_decision
+    FROM pim_outcomes o
+    LEFT JOIN nonstarter_reasons nr
+      ON nr.id = o.nonstarter_reason_id
+    WHERE o.case_id = ?
+  `).get(caseId);
+
+  const tasks = db.prepare(`
+    SELECT *
+    FROM pim_tasks
+    WHERE case_id = ?
+    ORDER BY id
+  `).all(caseId);
+
+  const context = outcome ? null : inferNonStarterContext(caseId);
+
+  return {
+    case: caseData,
+    outcome: outcome || null,
+    nonstarterReasons: getActiveNonStarterReasons(),
+    tasks,
+    context,
+  };
+}
 
 function normalizeOptionalText(value) {
   if (value == null) {
@@ -46,9 +99,10 @@ export async function GET(
       );
     }
 
-    const caseData = getCase(caseId);
+    // Batch 5F (Phase 6): migrated to PostgreSQL via lib/pim-data/nonstarter-read.js.
+    const data = await getNonStarterViewPg(caseId);
 
-    if (!caseData) {
+    if (!data) {
       return Response.json(
         {
           success: false,
@@ -58,37 +112,9 @@ export async function GET(
       );
     }
 
-    const outcome = db.prepare(`
-      SELECT
-        o.*,
-        nr.code AS nonstarter_reason_code,
-        nr.name AS nonstarter_reason_name,
-        nr.rule_reference,
-        nr.requires_authority_decision
-      FROM pim_outcomes o
-      LEFT JOIN nonstarter_reasons nr
-        ON nr.id = o.nonstarter_reason_id
-      WHERE o.case_id = ?
-    `).get(caseId);
-
-    const tasks = db.prepare(`
-      SELECT *
-      FROM pim_tasks
-      WHERE case_id = ?
-      ORDER BY id
-    `).all(caseId);
-
-    const context = outcome ? null : inferNonStarterContext(caseId);
-
     return Response.json({
       success: true,
-      data: {
-        case: caseData,
-        outcome: outcome || null,
-        nonstarterReasons: getActiveNonStarterReasons(),
-        tasks,
-        context,
-      },
+      data,
     });
   } catch (error) {
     const authResponse = authErrorResponse(error);
@@ -161,17 +187,16 @@ export async function POST(
       );
     }
 
-    const result = db.transaction(() =>
-      recordNonStarter({
-        caseId,
-        reasonId: reasonId != null ? Number(reasonId) : null,
-        reasonCode,
-        outcomeDate,
-        formNo,
-        remarks,
-        userId: user.id,
-      })
-    )();
+    // Batch 5D (Phase 6): migrated to PostgreSQL via lib/pim-data/nonstarter.js.
+    const result = await recordNonStarterPg({
+      caseId,
+      reasonId: reasonId != null ? Number(reasonId) : null,
+      reasonCode,
+      outcomeDate,
+      formNo,
+      remarks,
+      userId: user.id,
+    });
 
     return Response.json({
       success: true,

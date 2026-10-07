@@ -1,6 +1,11 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
-const db = require("../../../../lib/db");
+/*
+ * PostgreSQL-authoritative (production-completion sprint, 2026-10-07).
+ * See lib/pim-data/reports.js. Replaces the SQLite db.prepare(...).all()
+ * calls - no SQLite read remains here.
+ */
+
 const {
   requirePermission,
 } = require("../../../../lib/pim-auth");
@@ -8,9 +13,10 @@ const {
   authErrorResponse,
 } = require("../../../../lib/api-response");
 const {
-  buildReportQuery,
+  runReportPg,
+  exportReportPg,
   normalizedReportList,
-} = require("../../../../lib/pim-reports");
+} = require("../../../../lib/pim-data/reports");
 
 const EXPORT_ROW_CAP = 5000;
 
@@ -25,9 +31,7 @@ function toCsvValue(value) {
 
 function buildCsv(columns, rows) {
   const header = columns.map((column) => toCsvValue(column.label)).join(",");
-  const lines = rows.map((row) =>
-    columns.map((column) => toCsvValue(row[column.field])).join(",")
-  );
+  const lines = rows.map((row) => columns.map((column) => toCsvValue(row[column.field])).join(","));
   return [header, ...lines].join("\r\n");
 }
 
@@ -36,42 +40,17 @@ export async function GET(request) {
     requirePermission(request, "READ_CASE");
 
     const url = new URL(request.url);
-    const reportKey = String(
-      url.searchParams.get("report") || "register"
-    ).trim();
-    const format = String(
-      url.searchParams.get("format") || "json"
-    ).trim();
-    const {
-      report,
-      page,
-      pageSize,
-      offset,
-      queryParams,
-      countSql,
-      rowsSql,
-      exportSql,
-      totalsSql,
-      totalsQueryParams,
-    } = buildReportQuery(reportKey, url.searchParams);
-
-    const columns = report.columns.map(
-      ([field, label, type]) => ({
-        field,
-        label,
-        type,
-        sortable: Boolean(report.sortColumns[field]),
-      })
-    );
+    const reportKey = String(url.searchParams.get("report") || "register").trim();
+    const format = String(url.searchParams.get("format") || "json").trim();
 
     if (format === "csv") {
-      const exportRows = db
-        .prepare(exportSql)
-        .all(...queryParams, EXPORT_ROW_CAP);
+      const exportRows = await exportReportPg(reportKey, url.searchParams, EXPORT_ROW_CAP);
+      const { report } = await runReportPg(reportKey, url.searchParams);
+      const columns = report.columns.map(([field, label, type]) => ({
+        field, label, type, sortable: Boolean(report.sortColumns[field]),
+      }));
       const csv = buildCsv(columns, exportRows);
-      const filename = `pim-${reportKey}-${new Date()
-        .toISOString()
-        .slice(0, 10)}.csv`;
+      const filename = `pim-${reportKey}-${new Date().toISOString().slice(0, 10)}.csv`;
 
       return new Response(csv, {
         status: 200,
@@ -83,14 +62,11 @@ export async function GET(request) {
       });
     }
 
-    const count =
-      db.prepare(countSql).get(...queryParams).count || 0;
-    const rows = db
-      .prepare(rowsSql)
-      .all(...queryParams, pageSize, offset);
-    const totals = totalsSql
-      ? db.prepare(totalsSql).get(...totalsQueryParams)
-      : null;
+    const { report, page, pageSize, count, rows, totals } = await runReportPg(reportKey, url.searchParams);
+
+    const columns = report.columns.map(([field, label, type]) => ({
+      field, label, type, sortable: Boolean(report.sortColumns[field]),
+    }));
 
     return Response.json({
       success: true,
@@ -128,10 +104,7 @@ export async function GET(request) {
     return Response.json(
       {
         success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unable to load PIM report.",
+        message: error instanceof Error ? error.message : "Unable to load PIM report.",
       },
       { status: 500 }
     );

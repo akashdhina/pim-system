@@ -10,6 +10,9 @@ const {
 const {
   getCaseAction,
 } = require("../../../../lib/pim-action-link");
+const {
+  searchPimCasesPg,
+} = require("../../../../lib/pim-data/search-read");
 
 function positiveInt(value, fallback, max = 50) {
   const number = Number(value);
@@ -17,26 +20,20 @@ function positiveInt(value, fallback, max = 50) {
   return Math.min(number, max);
 }
 
-export async function GET(request) {
-  try {
-    requirePermission(request, "READ_CASE");
-
-    const url = new URL(request.url);
-    const q = String(url.searchParams.get("q") || "").trim();
-    const limit = positiveInt(url.searchParams.get("limit"), 20, 50);
-
-    if (q.length < 2) {
-      return Response.json({
-        success: true,
-        data: {
-          query: q,
-          rows: [],
-        },
-      });
-    }
-
-    const search = `%${q}%`;
-    const rows = db.prepare(`
+/*
+ * Batch 5G (Phase 6): GET below now calls lib/pim-data/search-read.js
+ * (PostgreSQL). This is the ORIGINAL SQLite search, moved verbatim into a
+ * function and kept, unused by GET, purely as an instant rollback (same
+ * convention as app/api/pim/nonstarter/[id]/route.js) and as the authentic
+ * SQLite baseline for scripts/test-pim-tasks-search-postgres.js. `q` is the
+ * trimmed query (>= 2 chars) and `limit` the clamped limit, as computed in
+ * GET; it returns the rows (each with `action`) that GET puts under
+ * `data.rows`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function searchPimCasesSqlite(q, limit) {
+  const search = `%${q}%`;
+  const rows = db.prepare(`
       SELECT
         c.id,
         c.pim_number,
@@ -155,18 +152,42 @@ export async function GET(request) {
       ORDER BY COALESCE(c.registration_date, c.received_date) DESC, c.id DESC
       LIMIT @limit
     `).all({
-      search,
-      limit,
-    });
+    search,
+    limit,
+  });
+
+  return rows.map((row) => ({
+    ...row,
+    action: getCaseAction(row),
+  }));
+}
+
+export async function GET(request) {
+  try {
+    requirePermission(request, "READ_CASE");
+
+    const url = new URL(request.url);
+    const q = String(url.searchParams.get("q") || "").trim();
+    const limit = positiveInt(url.searchParams.get("limit"), 20, 50);
+
+    if (q.length < 2) {
+      return Response.json({
+        success: true,
+        data: {
+          query: q,
+          rows: [],
+        },
+      });
+    }
+
+    // Batch 5G (Phase 6): migrated to PostgreSQL via lib/pim-data/search-read.js.
+    const rows = await searchPimCasesPg(q, limit);
 
     return Response.json({
       success: true,
       data: {
         query: q,
-        rows: rows.map((row) => ({
-          ...row,
-          action: getCaseAction(row),
-        })),
+        rows,
       },
     });
   } catch (error) {

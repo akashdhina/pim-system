@@ -13,44 +13,47 @@ type CaseData = {
   status_name: string;
 };
 
-type Fee = {
+type FeeSummary = {
+  totalFee: number | null;
+  shareAmount: number | null;
+  applicantPaid: number;
+  applicantOutstanding: number | null;
+  applicantOverpaid: number;
+  opSidePaid: number;
+  opSideOutstanding: number | null;
+  opSideOverpaid: number;
+  totalPaid: number;
+  totalOutstanding: number | null;
+  fullyPaid: boolean;
+};
+
+type Payment = {
   id: number;
-  party_name: string | null;
-  party_role: string | null;
-  amount_due: number | null;
-  amount_received: number | null;
+  paying_side: "APPLICANT" | "OP_SIDE";
+  amount: number;
+  payment_date: string;
+  payment_mode: string;
   dd_number: string | null;
   dd_date: string | null;
   bank_name: string | null;
-  payee: string | null;
-  received_date: string | null;
-  deposited_date: string | null;
-  status: string;
+  reference_number: string | null;
   remarks: string | null;
-};
-
-type FeeSchedule = {
-  totalFee: number | null;
-  shareAmount: number | null;
-  applicantShare: number | null;
-  oppositePartyShare: number | null;
+  created_at: string;
 };
 
 type PageData = {
   case: CaseData;
-  fee: Fee | null;
-  fees: Fee[];
-  feeSchedule: FeeSchedule;
+  summary: FeeSummary;
+  payments: Payment[];
 };
 
-type Side = "applicant" | "oppositeParty";
+type Side = "APPLICANT" | "OP_SIDE";
 
 type SideForm = {
-  amountReceived: string;
+  amount: string;
   ddNumber: string;
   ddDate: string;
   bankName: string;
-  payee: string;
 };
 
 function today() {
@@ -58,13 +61,7 @@ function today() {
 }
 
 function emptySideForm(): SideForm {
-  return {
-    amountReceived: "",
-    ddNumber: "",
-    ddDate: today(),
-    bankName: "",
-    payee: "Chairman, DLSA",
-  };
+  return { amount: "", ddNumber: "", ddDate: today(), bankName: "" };
 }
 
 function formatDate(value: string | null) {
@@ -97,8 +94,6 @@ export default function FeePage() {
 
   const [applicant, setApplicant] = useState<SideForm>(emptySideForm());
   const [oppositeParty, setOppositeParty] = useState<SideForm>(emptySideForm());
-  const [receivedDate, setReceivedDate] = useState(today());
-  const [depositedDate, setDepositedDate] = useState("");
   const [remarks, setRemarks] = useState("");
 
   useEffect(() => {
@@ -106,26 +101,8 @@ export default function FeePage() {
   }, [id]);
 
   function updateSide(side: Side, field: keyof SideForm, value: string) {
-    const setter = side === "applicant" ? setApplicant : setOppositeParty;
-    setter((current) => ({
-      ...current,
-      [field]: value,
-    }));
-  }
-
-  function fillFromFee(fee: Fee | null, shareAmount: number | null): SideForm {
-    return {
-      amountReceived:
-        fee?.amount_received && fee.amount_received > 0
-          ? String(fee.amount_received)
-          : shareAmount == null
-            ? ""
-            : String(shareAmount),
-      ddNumber: fee?.dd_number || "",
-      ddDate: fee?.dd_date || today(),
-      bankName: fee?.bank_name || "",
-      payee: fee?.payee || "Chairman, DLSA",
-    };
+    const setter = side === "APPLICANT" ? setApplicant : setOppositeParty;
+    setter((current) => ({ ...current, [field]: value }));
   }
 
   async function loadData() {
@@ -133,32 +110,16 @@ export default function FeePage() {
       setLoading(true);
       setError("");
 
-      const response = await fetch(`/api/pim/fee/${id}`, {
-        cache: "no-store",
-      });
+      const response = await fetch(`/api/pim/fee/${id}`, { cache: "no-store" });
       const json = await response.json();
 
       if (!response.ok || !json.success) {
         throw new Error(json.message || "Unable to load fee data.");
       }
 
-      const pageData = json.data as PageData;
-      setData(pageData);
-
-      // There is exactly one case-level MEDIATION_FEE row now
-      // (Phase 6.1) - it is linked to whichever side's payment
-      // first created it, not to both sides at once. Pre-fill
-      // whichever side matches; leave the other blank for fresh
-      // entry rather than guessing.
-      const feeRow = pageData.fee;
-      const applicantFee = feeRow?.party_role === "APPLICANT" ? feeRow : null;
-      const oppositeFee = feeRow?.party_role === "OPPOSITE_PARTY" ? feeRow : null;
-      const shareAmount = pageData.feeSchedule.shareAmount;
-
-      setApplicant(fillFromFee(applicantFee, shareAmount));
-      setOppositeParty(fillFromFee(oppositeFee, shareAmount));
-      setReceivedDate(feeRow?.received_date || today());
-      setDepositedDate(feeRow?.deposited_date || "");
+      setData(json.data as PageData);
+      setApplicant(emptySideForm());
+      setOppositeParty(emptySideForm());
       setRemarks("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load fee data.");
@@ -167,16 +128,36 @@ export default function FeePage() {
     }
   }
 
-  function validateSide(label: string, form: SideForm, shareAmount: number | null) {
-    if (shareAmount == null) return "Mediation fee could not be calculated for this claim amount.";
-    if (!Number.isFinite(Number(form.amountReceived)) || Number(form.amountReceived) <= 0) {
-      return `${label} amount received must be greater than zero.`;
+  function validateSide(label: string, form: SideForm): string | null {
+    const hasAnyInput = form.amount || form.ddNumber || form.bankName;
+    if (!hasAnyInput) return null; // this side simply isn't part of this submission
+    if (!Number.isFinite(Number(form.amount)) || Number(form.amount) <= 0) {
+      return `${label} amount must be greater than zero.`;
     }
     if (!form.ddNumber.trim()) return `${label} DD number is required.`;
     if (!form.ddDate) return `${label} DD date is required.`;
     if (!form.bankName.trim()) return `${label} bank name is required.`;
-    if (form.payee.trim() !== "Chairman, DLSA") return `${label} DD must be drawn in favour of Chairman, DLSA.`;
     return null;
+  }
+
+  async function postPayment(payingSide: Side, form: SideForm) {
+    const response = await fetch(`/api/pim/fee/${id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        payingSide,
+        amount: Number(form.amount),
+        ddNumber: form.ddNumber.trim(),
+        ddDate: form.ddDate,
+        bankName: form.bankName.trim(),
+        remarks: remarks.trim() || null,
+      }),
+    });
+    const json = await response.json();
+    if (!response.ok || !json.success) {
+      throw new Error(json.message || "Unable to record mediation fee.");
+    }
+    return json;
   }
 
   async function saveFee() {
@@ -185,56 +166,29 @@ export default function FeePage() {
     setError("");
     setSuccess("");
 
-    const shareAmount = data.feeSchedule.shareAmount;
-    const applicantError = validateSide("Applicant", applicant, shareAmount);
-    if (applicantError) {
-      setError(applicantError);
-      return;
+    const applicantError = validateSide("Applicant", applicant);
+    if (applicantError) return setError(applicantError);
+
+    const oppositeError = validateSide("Opposite party side", oppositeParty);
+    if (oppositeError) return setError(oppositeError);
+
+    const applicantEntered = Boolean(applicant.amount);
+    const oppositeEntered = Boolean(oppositeParty.amount);
+
+    if (!applicantEntered && !oppositeEntered) {
+      return setError("Enter at least one side's payment.");
     }
 
-    const oppositeError = validateSide("Opposite party", oppositeParty, shareAmount);
-    if (oppositeError) {
-      setError(oppositeError);
-      return;
-    }
-
-    if (!receivedDate) {
-      setError("Received date is required.");
-      return;
-    }
-
-    if (!confirm("Record mediation fee receipt from both sides?")) return;
+    if (!confirm("Record this mediation fee payment?")) return;
 
     try {
       setSaving(true);
 
-      const response = await fetch(`/api/pim/fee/${id}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          applicantAmountReceived: Number(applicant.amountReceived),
-          applicantDdNumber: applicant.ddNumber.trim(),
-          applicantDdDate: applicant.ddDate,
-          applicantBankName: applicant.bankName.trim(),
-          applicantPayee: applicant.payee.trim(),
-          oppositePartyAmountReceived: Number(oppositeParty.amountReceived),
-          oppositePartyDdNumber: oppositeParty.ddNumber.trim(),
-          oppositePartyDdDate: oppositeParty.ddDate,
-          oppositePartyBankName: oppositeParty.bankName.trim(),
-          oppositePartyPayee: oppositeParty.payee.trim(),
-          receivedDate,
-          depositedDate: depositedDate || null,
-          remarks: remarks.trim() || null,
-        }),
-      });
+      let lastResult = null;
+      if (applicantEntered) lastResult = await postPayment("APPLICANT", applicant);
+      if (oppositeEntered) lastResult = await postPayment("OP_SIDE", oppositeParty);
 
-      const json = await response.json();
-
-      if (!response.ok || !json.success) {
-        throw new Error(json.message || "Unable to record mediation fee.");
-      }
-
-      setSuccess(json.message || "Mediation fee recorded.");
+      setSuccess(lastResult?.message || "Mediation fee recorded.");
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to record mediation fee.");
@@ -254,10 +208,7 @@ export default function FeePage() {
   if (!data) return null;
 
   const canCollect = data.case.status_code === "FEE_PENDING";
-  // One case-level MEDIATION_FEE row (Phase 6.1): "received" means
-  // that single row's cumulative amount_received has cleared the
-  // full statutory amount_due.
-  const feeReceived = data.fee?.status === "RECEIVED";
+  const summary = data.summary;
 
   return (
     <main className="min-h-screen bg-gray-100 p-6">
@@ -277,36 +228,34 @@ export default function FeePage() {
         </section>
 
         <section className="rounded-lg bg-white p-6 shadow">
-          <h2 className="mb-5 text-lg font-semibold">Schedule II Calculation</h2>
-          <div className="grid gap-5 md:grid-cols-4">
+          <h2 className="mb-5 text-lg font-semibold">Fee Summary</h2>
+          <div className="grid gap-5 md:grid-cols-3">
             <Info label="Claim Amount" value={money(data.case.claim_amount)} />
-            <Info label="Total Mediation Fee" value={money(data.feeSchedule.totalFee)} />
-            <Info label="Applicant Share" value={money(data.feeSchedule.applicantShare)} />
-            <Info label="Opposite Party Share" value={money(data.feeSchedule.oppositePartyShare)} />
+            <Info label="Total Mediation Fee" value={money(summary.totalFee)} />
+            <Info label="Required Share (each side)" value={money(summary.shareAmount)} />
+          </div>
+          <div className="mt-5 grid gap-5 md:grid-cols-2">
+            <SideSummary title="Applicant" paid={summary.applicantPaid} outstanding={summary.applicantOutstanding} overpaid={summary.applicantOverpaid} />
+            <SideSummary title="Opposite Party Side" paid={summary.opSidePaid} outstanding={summary.opSideOutstanding} overpaid={summary.opSideOverpaid} />
           </div>
         </section>
 
         <section className="rounded-lg bg-white p-6 shadow">
           <h2 className="mb-5 text-lg font-semibold">Fee Receipt</h2>
 
-          {feeReceived ? (
+          {summary.fullyPaid ? (
             <div className="space-y-5">
-              <div className="rounded border border-green-300 bg-green-50 p-4 text-sm text-green-800">Mediation fee has been received in full.</div>
-              <FeeSummary title="Mediation Fee (Case-Level)" fee={data.fee} />
+              <div className="rounded border border-green-300 bg-green-50 p-4 text-sm text-green-800">Mediation fee has been received in full from both sides.</div>
               <a href={`/pim/mediator/${id}`} className="inline-flex rounded bg-black px-5 py-3 text-sm font-medium text-white">Assign Mediator</a>
             </div>
           ) : !canCollect ? (
             <div className="rounded border bg-gray-50 p-4 text-sm text-gray-700">This case is not currently available for mediation fee collection.</div>
           ) : (
             <div className="space-y-6">
+              <p className="text-sm text-gray-600">Enter either or both sides' payment below. Each side is recorded as its own immutable payment entry.</p>
               <div className="grid gap-6 md:grid-cols-2">
-                <SideCard title="Applicant" form={applicant} shareAmount={data.feeSchedule.applicantShare} onChange={(field, value) => updateSide("applicant", field, value)} />
-                <SideCard title="Opposite Party" form={oppositeParty} shareAmount={data.feeSchedule.oppositePartyShare} onChange={(field, value) => updateSide("oppositeParty", field, value)} />
-              </div>
-
-              <div className="grid gap-5 md:grid-cols-2">
-                <Field label="Received Date" value={receivedDate} onChange={setReceivedDate} type="date" />
-                <Field label="Deposited Date" value={depositedDate} onChange={setDepositedDate} type="date" />
+                <SideCard title="Applicant" outstanding={summary.applicantOutstanding} form={applicant} onChange={(field, value) => updateSide("APPLICANT", field, value)} />
+                <SideCard title="Opposite Party Side" outstanding={summary.opSideOutstanding} form={oppositeParty} onChange={(field, value) => updateSide("OP_SIDE", field, value)} />
               </div>
 
               <div>
@@ -320,33 +269,61 @@ export default function FeePage() {
             </div>
           )}
         </section>
+
+        {data.payments.length > 0 && (
+          <section className="rounded-lg bg-white p-6 shadow">
+            <h2 className="mb-5 text-lg font-semibold">Payment History</h2>
+            <div className="space-y-3">
+              {data.payments.map((payment) => (
+                <div key={payment.id} className="rounded border p-4 text-sm">
+                  <div className="flex justify-between">
+                    <span className="font-semibold">{payment.paying_side === "APPLICANT" ? "Applicant" : "Opposite Party Side"}</span>
+                    <span>{money(payment.amount)}</span>
+                  </div>
+                  <div className="mt-1 text-xs text-gray-600">
+                    {formatDate(payment.payment_date)} · {payment.payment_mode}
+                    {payment.dd_number ? ` · DD ${payment.dd_number}${payment.dd_date ? ` dated ${formatDate(payment.dd_date)}` : ""}` : ""}
+                    {payment.bank_name ? ` · ${payment.bank_name}` : ""}
+                  </div>
+                  {payment.remarks && <div className="mt-1 text-xs text-gray-600">{payment.remarks}</div>}
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
     </main>
   );
 }
 
-function FeeSummary({ title, fee }: { title: string; fee: Fee | null }) {
+function SideSummary({ title, paid, outstanding, overpaid }: { title: string; paid: number; outstanding: number | null; overpaid: number }) {
   return (
     <div className="rounded border p-5">
       <h3 className="font-semibold">{title}</h3>
-      <div className="mt-4 grid gap-4 sm:grid-cols-2">
-        <Info label="Amount Due" value={money(fee?.amount_due)} />
-        <Info label="Amount Received" value={money(fee?.amount_received)} />
-        <Info label="Latest DD Number" value={fee?.dd_number || "-"} />
-        <Info label="Latest DD Date" value={formatDate(fee?.dd_date || null)} />
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Info label="Paid" value={money(paid)} />
+        <Info label="Outstanding" value={outstanding === 0 ? "Fully paid" : money(outstanding)} />
       </div>
-      {fee?.remarks && (
-        <div className="mt-4">
-          <div className="text-xs font-medium uppercase tracking-wide text-gray-500">Payment History</div>
-          <pre className="mt-1 whitespace-pre-wrap text-sm text-gray-800">{fee.remarks}</pre>
-        </div>
+      {overpaid > 0 && (
+        <div className="mt-3 rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">Overpaid by {money(overpaid)}. Please verify.</div>
       )}
     </div>
   );
 }
 
-function SideCard({ title, form, shareAmount, onChange }: { title: string; form: SideForm; shareAmount: number | null; onChange: (field: keyof SideForm, value: string) => void }) {
-  return <div className="rounded border p-5"><h3 className="font-semibold">{title}</h3><p className="mt-1 text-sm text-gray-600">Required share: {money(shareAmount)}</p><div className="mt-5 space-y-4"><Field label="Amount Received" value={form.amountReceived} onChange={(value) => onChange("amountReceived", value)} type="number" /><Field label="DD Number" value={form.ddNumber} onChange={(value) => onChange("ddNumber", value)} /><Field label="DD Date" value={form.ddDate} onChange={(value) => onChange("ddDate", value)} type="date" /><Field label="Bank Name" value={form.bankName} onChange={(value) => onChange("bankName", value)} /><Field label="Payee" value={form.payee} onChange={(value) => onChange("payee", value)} /></div></div>;
+function SideCard({ title, outstanding, form, onChange }: { title: string; outstanding: number | null; form: SideForm; onChange: (field: keyof SideForm, value: string) => void }) {
+  return (
+    <div className="rounded border p-5">
+      <h3 className="font-semibold">{title}</h3>
+      <p className="mt-1 text-sm text-gray-600">Outstanding: {outstanding === 0 ? "Fully paid" : money(outstanding)}</p>
+      <div className="mt-5 space-y-4">
+        <Field label="Amount" value={form.amount} onChange={(value) => onChange("amount", value)} type="number" />
+        <Field label="DD Number" value={form.ddNumber} onChange={(value) => onChange("ddNumber", value)} />
+        <Field label="DD Date" value={form.ddDate} onChange={(value) => onChange("ddDate", value)} type="date" />
+        <Field label="Bank Name" value={form.bankName} onChange={(value) => onChange("bankName", value)} />
+      </div>
+    </div>
+  );
 }
 
 function Info({ label, value }: { label: string; value: string }) {

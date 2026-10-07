@@ -165,8 +165,8 @@ function ProtectedPimLayout({
 
   if (loading || !authenticated) {
     return (
-      <main className="min-h-screen bg-gray-100 p-6">
-        <div className="rounded-lg border bg-white p-6">
+      <main className="min-h-screen bg-slate-50 p-6">
+        <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
           {loading ? "Loading PIM access..." : "Redirecting to login..."}
         </div>
       </main>
@@ -175,8 +175,8 @@ function ProtectedPimLayout({
 
   if (user?.must_change_password) {
     return (
-      <main className="min-h-screen bg-gray-100 p-6">
-        <div className="rounded-lg border bg-white p-6">
+      <main className="min-h-screen bg-slate-50 p-6">
+        <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
           Redirecting to password change...
         </div>
       </main>
@@ -184,17 +184,17 @@ function ProtectedPimLayout({
   }
 
   return (
-    <div className="min-h-screen bg-gray-100">
-      <header className="border-b bg-white print:hidden">
+    <div className="min-h-screen bg-slate-50">
+      <header className="border-b border-slate-200 bg-white/95 shadow-sm print:hidden">
         <div className="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-4 lg:flex-row lg:items-center lg:justify-between md:px-6">
           <div>
             <Link
               href="/pim"
-              className="text-lg font-bold text-gray-950"
+              className="text-lg font-bold text-slate-950"
             >
               DLSA Nilgiris PIM
             </Link>
-            <div className="text-sm text-gray-500">
+            <div className="text-sm text-slate-500">
               Case Management System
             </div>
           </div>
@@ -207,19 +207,19 @@ function ProtectedPimLayout({
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search cases"
-              className="min-w-0 flex-1 rounded border px-3 py-2 text-sm"
+              className="min-w-0 flex-1 rounded border border-slate-300 bg-slate-50 px-3 py-2 text-sm outline-none focus:border-cyan-500 focus:bg-white"
             />
             <button
               type="submit"
               disabled={search.trim().length < 2}
-              className="rounded border px-3 py-2 text-sm font-medium disabled:opacity-40"
+              className="rounded bg-slate-950 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
             >
               Search
             </button>
           </form>
 
-          <div className="text-sm text-gray-700 md:text-right">
-            <div className="font-medium">
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 md:text-right">
+            <div className="font-semibold text-slate-950">
               {user?.display_name || "-"}
             </div>
             <div className="mb-2">
@@ -229,7 +229,7 @@ function ProtectedPimLayout({
               type="button"
               onClick={logout}
               disabled={signingOut}
-              className="rounded border px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+              className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium hover:border-slate-500 disabled:opacity-50"
             >
               {signingOut ? "Signing out..." : "Logout"}
             </button>
@@ -250,10 +250,10 @@ function ProtectedPimLayout({
               <Link
                 key={item.href}
                 href={item.href}
-                className={`whitespace-nowrap rounded px-3 py-2 text-sm font-medium ${
+                className={`whitespace-nowrap rounded px-3 py-2 text-sm font-medium transition ${
                   pathname === item.href
-                    ? "bg-black text-white"
-                    : "text-gray-700 hover:bg-gray-100"
+                    ? "bg-gradient-to-r from-slate-950 to-cyan-700 text-white shadow-sm"
+                    : "text-slate-700 hover:bg-slate-100"
                 }`}
               >
                 {item.label}
@@ -264,23 +264,23 @@ function ProtectedPimLayout({
       </header>
 
       {workflowCaseId && (
-        <div className="border-b bg-gray-50">
+        <div className="border-b border-slate-200 bg-white">
           <div className="mx-auto flex max-w-7xl gap-2 px-4 py-3 text-sm md:px-6">
             <Link
               href={`/pim/case/${workflowCaseId}`}
-              className="rounded border bg-white px-3 py-2 font-medium"
+              className="rounded border border-slate-300 bg-slate-50 px-3 py-2 font-medium hover:border-slate-500"
             >
               Back to Case
             </Link>
             <Link
               href="/pim/tasks"
-              className="rounded border bg-white px-3 py-2 font-medium"
+              className="rounded border border-slate-300 bg-slate-50 px-3 py-2 font-medium hover:border-slate-500"
             >
               Back to Tasks
             </Link>
             <Link
               href="/pim"
-              className="rounded border bg-white px-3 py-2 font-medium"
+              className="rounded border border-slate-300 bg-slate-50 px-3 py-2 font-medium hover:border-slate-500"
             >
               Dashboard
             </Link>

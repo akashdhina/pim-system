@@ -1,6 +1,13 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
-const db = require("../../../../../lib/db");
+/*
+ * PostgreSQL-authoritative (production-completion sprint, 2026-10-07).
+ * Replaces the SQLite db.prepare(...).get() calls, including the one
+ * date-math call (SQLite's `date(?, '+1 month', '-1 day')` for month-end)
+ * - computed here in pure JS instead, since it needs no database
+ * round-trip at all.
+ */
+
 const {
   requirePermission,
 } = require("../../../../../lib/pim-auth");
@@ -10,6 +17,9 @@ const {
 const {
   officeDate,
 } = require("../../../../../lib/pim-time");
+const {
+  getSql,
+} = require("../../../../../lib/pim-postgres");
 
 function parseMonth(value) {
   const text = String(value || "").trim();
@@ -18,10 +28,11 @@ function parseMonth(value) {
 }
 
 function monthBounds(month) {
+  const [year, monthNum] = month.split("-").map(Number);
   const start = `${month}-01`;
-  const end = db
-    .prepare(`SELECT date(?, '+1 month', '-1 day') AS value`)
-    .get(start).value;
+  // Day 0 of the following month = the last day of this month.
+  const lastDay = new Date(year, monthNum, 0).getDate();
+  const end = `${month}-${String(lastDay).padStart(2, "0")}`;
   return { start, end };
 }
 
@@ -32,116 +43,56 @@ export async function GET(request) {
     const url = new URL(request.url);
     const month = parseMonth(url.searchParams.get("month"));
     const { start, end } = monthBounds(month);
+    const sql = getSql();
 
-    const opening = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM pim_cases c
-        WHERE c.registration_date IS NOT NULL
-          AND c.registration_date < ?
-          AND (c.closed_at IS NULL OR c.closed_at >= ?)
-      `
-      )
-      .get(start, start).count;
-
-    const newCases = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM pim_cases c
-        WHERE c.registration_date IS NOT NULL
-          AND c.registration_date BETWEEN ? AND ?
-      `
-      )
-      .get(start, end).count;
-
-    const disposalBreakdown = db
-      .prepare(
-        `
+    const [
+      [{ count: opening }],
+      [{ count: newCases }],
+      [disposalBreakdown],
+      [{ count: actualClosing }],
+      [{ count: initialNoticesIssued }],
+      [{ count: finalNoticesIssued }],
+      [{ count: feePaidCases }],
+      [{ count: mediationsCommenced }],
+      [{ count: sittingsHeld }],
+    ] = await Promise.all([
+      sql`
+        SELECT COUNT(*)::int AS count FROM pim_cases c
+        WHERE c.registration_date IS NOT NULL AND c.registration_date < ${start}
+          AND (c.closed_at IS NULL OR c.closed_at >= ${start})
+      `,
+      sql`
+        SELECT COUNT(*)::int AS count FROM pim_cases c
+        WHERE c.registration_date IS NOT NULL AND c.registration_date BETWEEN ${start} AND ${end}
+      `,
+      sql`
         SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN c.outcome_type = 'SETTLED' THEN 1 ELSE 0 END) AS settled,
-          SUM(CASE WHEN c.outcome_type = 'FAILED' THEN 1 ELSE 0 END) AS failed,
-          SUM(CASE WHEN c.outcome_type = 'NON_STARTER' THEN 1 ELSE 0 END) AS non_starter,
-          SUM(CASE WHEN c.outcome_type = 'WITHDRAWN' THEN 1 ELSE 0 END) AS withdrawn
+          COUNT(*)::int AS total,
+          SUM(CASE WHEN c.outcome_type = 'SETTLED' THEN 1 ELSE 0 END)::int AS settled,
+          SUM(CASE WHEN c.outcome_type = 'FAILED' THEN 1 ELSE 0 END)::int AS failed,
+          SUM(CASE WHEN c.outcome_type = 'NON_STARTER' THEN 1 ELSE 0 END)::int AS non_starter,
+          SUM(CASE WHEN c.outcome_type = 'WITHDRAWN' THEN 1 ELSE 0 END)::int AS withdrawn
         FROM pim_cases c
-        WHERE c.closed_at IS NOT NULL
-          AND c.closed_at BETWEEN ? AND ?
-      `
-      )
-      .get(start, end);
+        WHERE c.closed_at IS NOT NULL AND c.closed_at BETWEEN ${start} AND ${end}
+      `,
+      sql`
+        SELECT COUNT(*)::int AS count FROM pim_cases c
+        WHERE c.registration_date IS NOT NULL AND c.registration_date <= ${end}
+          AND (c.closed_at IS NULL OR c.closed_at > ${end})
+      `,
+      sql`SELECT COUNT(*)::int AS count FROM pim_notices n WHERE n.notice_type = 'FORM_2_INITIAL' AND n.notice_date BETWEEN ${start} AND ${end}`,
+      sql`SELECT COUNT(*)::int AS count FROM pim_notices n WHERE n.notice_type = 'FORM_2_FINAL' AND n.notice_date BETWEEN ${start} AND ${end}`,
+      sql`
+        SELECT COUNT(DISTINCT f.case_id)::int AS count FROM pim_fees f
+        WHERE f.fee_type = 'MEDIATION_FEE' AND f.received_date BETWEEN ${start} AND ${end}
+          AND f.amount_due IS NOT NULL AND f.amount_received >= f.amount_due
+      `,
+      sql`SELECT COUNT(DISTINCT ms.case_id)::int AS count FROM mediation_sessions ms WHERE ms.sitting_number = 1 AND ms.actual_date BETWEEN ${start} AND ${end}`,
+      sql`SELECT COUNT(*)::int AS count FROM mediation_sessions ms WHERE ms.actual_date BETWEEN ${start} AND ${end}`,
+    ]);
 
     const disposals = disposalBreakdown.total || 0;
     const expectedClosing = opening + newCases - disposals;
-
-    const actualClosing = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM pim_cases c
-        WHERE c.registration_date IS NOT NULL
-          AND c.registration_date <= ?
-          AND (c.closed_at IS NULL OR c.closed_at > ?)
-      `
-      )
-      .get(end, end).count;
-
-    const initialNoticesIssued = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM pim_notices n
-        WHERE n.notice_type = 'FORM_2_INITIAL'
-          AND n.notice_date BETWEEN ? AND ?
-      `
-      )
-      .get(start, end).count;
-
-    const finalNoticesIssued = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM pim_notices n
-        WHERE n.notice_type = 'FORM_2_FINAL'
-          AND n.notice_date BETWEEN ? AND ?
-      `
-      )
-      .get(start, end).count;
-
-    const feePaidCases = db
-      .prepare(
-        `
-        SELECT COUNT(DISTINCT f.case_id) AS count
-        FROM pim_fees f
-        WHERE f.fee_type = 'MEDIATION_FEE'
-          AND f.received_date BETWEEN ? AND ?
-          AND f.amount_due IS NOT NULL
-          AND f.amount_received >= f.amount_due
-      `
-      )
-      .get(start, end).count;
-
-    const mediationsCommenced = db
-      .prepare(
-        `
-        SELECT COUNT(DISTINCT ms.case_id) AS count
-        FROM mediation_sessions ms
-        WHERE ms.sitting_number = 1
-          AND ms.actual_date BETWEEN ? AND ?
-      `
-      )
-      .get(start, end).count;
-
-    const sittingsHeld = db
-      .prepare(
-        `
-        SELECT COUNT(*) AS count
-        FROM mediation_sessions ms
-        WHERE ms.actual_date BETWEEN ? AND ?
-      `
-      )
-      .get(start, end).count;
 
     return Response.json({
       success: true,
@@ -183,10 +134,7 @@ export async function GET(request) {
     return Response.json(
       {
         success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unable to load monthly report.",
+        message: error instanceof Error ? error.message : "Unable to load monthly report.",
       },
       { status: 500 }
     );

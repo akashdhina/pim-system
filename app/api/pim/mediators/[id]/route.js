@@ -7,6 +7,14 @@ const {
 const {
   authErrorResponse,
 } = require("../../../../../lib/api-response");
+const {
+  getMediatorDetailPg,
+} = require("../../../../../lib/pim-data/mediator-registry-read");
+const {
+  checkDuplicateActiveEnrollmentPg,
+  getMediatorRawPg,
+  updateMediatorPg,
+} = require("../../../../../lib/pim-data/mediator-registry");
 
 function clean(value) {
   const text = String(value || "").trim();
@@ -33,7 +41,13 @@ function conflict(message) {
   );
 }
 
-function getMediator(id) {
+/*
+ * The ORIGINAL SQLite single-mediator aggregate query, kept unused (by the
+ * route handlers; still called from getMediatorDetailSqlite below) as an
+ * instant rollback and as the authentic SQLite baseline for
+ * scripts/test-pim-mediator-registry-postgres.js.
+ */
+function getMediatorSqlite(id) {
   return db.prepare(`
     SELECT
       m.*,
@@ -52,7 +66,60 @@ function getMediator(id) {
   `).get(id);
 }
 
-function duplicateActiveEnrollment(enrollmentNo, id) {
+/*
+ * The ORIGINAL SQLite GET body (mediator + assignments + sessions), kept
+ * unused as an instant rollback and as the authentic SQLite parity
+ * baseline. Returns exactly what GET puts under `data`, or null for a
+ * missing mediator (route maps that to 404).
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function getMediatorDetailSqlite(id) {
+  const mediator = getMediatorSqlite(id);
+  if (!mediator) return null;
+
+  const assignments = db.prepare(`
+    SELECT
+      a.*,
+      c.pim_number,
+      c.received_number,
+      c.outcome_type,
+      s.name AS status_name
+    FROM pim_mediator_assignments a
+    JOIN pim_cases c ON c.id = a.case_id
+    LEFT JOIN status_master s ON s.id = c.current_status_id
+    WHERE a.mediator_id = ?
+    ORDER BY
+      CASE WHEN a.status = 'ACTIVE' THEN 0 ELSE 1 END,
+      a.assignment_date DESC,
+      a.id DESC
+  `).all(id);
+
+  const sessions = db.prepare(`
+    SELECT
+      ms.*,
+      c.pim_number,
+      c.received_number
+    FROM mediation_sessions ms
+    JOIN pim_mediator_assignments a ON a.id = ms.assignment_id
+    JOIN pim_cases c ON c.id = ms.case_id
+    WHERE a.mediator_id = ?
+    ORDER BY COALESCE(ms.actual_date, ms.scheduled_date) DESC, ms.id DESC
+    LIMIT 50
+  `).all(id);
+
+  return {
+    mediator,
+    activeAssignments: assignments.filter(
+      (assignment) => assignment.status === "ACTIVE"
+    ),
+    assignments,
+    sessions,
+  };
+}
+
+// The ORIGINAL SQLite duplicate-enrollment check, kept unused as an instant rollback.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function duplicateActiveEnrollmentSqlite(enrollmentNo, id) {
   if (!enrollmentNo) return null;
 
   return db.prepare(`
@@ -115,10 +182,10 @@ function validatePatch(input, current) {
     Object.prototype.hasOwnProperty.call(input, "name")
       ? input.name
       : current.name;
-  const enrollmentNo =
-    Object.prototype.hasOwnProperty.call(input, "enrollment_no")
-      ? input.enrollment_no
-      : current.enrollment_no;
+  const category =
+    Object.prototype.hasOwnProperty.call(input, "category")
+      ? input.category
+      : current.category;
   const email =
     Object.prototype.hasOwnProperty.call(input, "email")
       ? input.email
@@ -137,7 +204,12 @@ function validatePatch(input, current) {
       : current.panel_valid_until;
 
   if (!name) return "Mediator name is required.";
-  if (!enrollmentNo) return "Enrollment number is required.";
+  if (!category) return "Category is required.";
+  // Batch 5H-a (Phase 6) mediator-panel reconciliation: enrollment number is
+  // NOT mandatory (see the matching comment in mediators/route.js's
+  // validateMediatorInput). A PATCH that never touches enrollment_no must
+  // not be blocked just because the current stored value is NULL - two real
+  // mediators (Rajesh, Ravikumar) already have a NULL enrollment_no today.
   if (!validatePhone(phone)) return "Phone number is not valid.";
   if (!validateEmail(email)) return "Email address is not valid.";
 
@@ -171,9 +243,10 @@ export async function GET(request, { params }) {
       return validationError("Invalid mediator ID.");
     }
 
-    const mediator = getMediator(id);
+    // Batch 5H (Phase 6): migrated to PostgreSQL via lib/pim-data/mediator-registry-read.js.
+    const detail = await getMediatorDetailPg(id);
 
-    if (!mediator) {
+    if (!detail) {
       return Response.json(
         {
           success: false,
@@ -183,45 +256,15 @@ export async function GET(request, { params }) {
       );
     }
 
-    const assignments = db.prepare(`
-      SELECT
-        a.*,
-        c.pim_number,
-        c.received_number,
-        c.outcome_type,
-        s.name AS status_name
-      FROM pim_mediator_assignments a
-      JOIN pim_cases c ON c.id = a.case_id
-      LEFT JOIN status_master s ON s.id = c.current_status_id
-      WHERE a.mediator_id = ?
-      ORDER BY
-        CASE WHEN a.status = 'ACTIVE' THEN 0 ELSE 1 END,
-        a.assignment_date DESC,
-        a.id DESC
-    `).all(id);
-
-    const sessions = db.prepare(`
-      SELECT
-        ms.*,
-        c.pim_number,
-        c.received_number
-      FROM mediation_sessions ms
-      JOIN pim_mediator_assignments a ON a.id = ms.assignment_id
-      JOIN pim_cases c ON c.id = ms.case_id
-      WHERE a.mediator_id = ?
-      ORDER BY COALESCE(ms.actual_date, ms.scheduled_date) DESC, ms.id DESC
-      LIMIT 50
-    `).all(id);
-
     return Response.json({
       success: true,
       data: {
-        mediator,
-        activeAssignments: assignments.filter(
+        mediator: detail.mediator,
+        activeAssignments: detail.assignments.filter(
           (assignment) => assignment.status === "ACTIVE"
         ),
-        assignments,
-        sessions,
+        assignments: detail.assignments,
+        sessions: detail.sessions,
       },
     });
   } catch (error) {
@@ -253,11 +296,8 @@ export async function PATCH(request, { params }) {
       return validationError("Invalid mediator ID.");
     }
 
-    const current = db.prepare(`
-      SELECT *
-      FROM mediators
-      WHERE id = ?
-    `).get(id);
+    // Batch 5H (Phase 6): migrated to PostgreSQL via lib/pim-data/mediator-registry.js.
+    const current = await getMediatorRawPg(id);
 
     if (!current) {
       return Response.json(
@@ -285,7 +325,7 @@ export async function PATCH(request, { params }) {
         : current.active;
 
     if (nextActive === 1) {
-      const duplicate = duplicateActiveEnrollment(nextEnrollment, id);
+      const duplicate = await checkDuplicateActiveEnrollmentPg(nextEnrollment, id);
       if (duplicate) {
         return conflict(
           `Active mediator with enrollment number ${nextEnrollment} already exists.`
@@ -315,43 +355,19 @@ export async function PATCH(request, { params }) {
       return validationError("No mediator fields were supplied.");
     }
 
-    const sql = `
-      UPDATE mediators
-      SET
-        ${updates.map((column) => `${column} = ?`).join(",\n        ")},
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `;
-    const values = updates.map((column) => input[column]);
-
-    db.prepare(sql).run(...values, id);
-
-    db.prepare(`
-      INSERT INTO audit_log (
-        table_name,
-        record_id,
-        action,
-        old_value,
-        new_value,
-        changed_by,
-        reason
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      "mediators",
-      id,
-      "UPDATE",
-      JSON.stringify(
-        Object.fromEntries(updates.map((column) => [column, current[column]]))
-      ),
-      JSON.stringify(
-        Object.fromEntries(updates.map((column) => [column, input[column]]))
-      ),
-      user.id,
-      "Mediator updated through mediator register."
+    const updateValues = Object.fromEntries(
+      updates.map((column) => [column, input[column]])
+    );
+    const oldValues = Object.fromEntries(
+      updates.map((column) => [column, current[column]])
     );
 
-    const mediator = getMediator(id);
+    const mediator = await updateMediatorPg(id, updateValues, {
+      oldValues,
+      newValues: updateValues,
+      userId: user.id,
+      reason: "Mediator updated through mediator register.",
+    });
 
     return Response.json({
       success: true,

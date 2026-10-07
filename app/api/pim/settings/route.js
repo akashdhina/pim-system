@@ -8,18 +8,22 @@ const {
 } = require("../../../../lib/api-response");
 const {
   DEFAULT_SETTINGS,
-  getSettings,
+  getSettings, // SQLite version - kept unused by GET as an instant rollback (Batch 4)
   updateSettings,
 } = require("../../../../lib/pim-settings");
+const {
+  getSettings: getSettingsPg,
+} = require("../../../../lib/pim-data/settings");
 
 export async function GET(request) {
   try {
     requirePermission(request, "VIEW_SETTINGS");
 
+    // Batch 4 (Phase 6): migrated to PostgreSQL via lib/pim-data/settings.js.
     return Response.json({
       success: true,
       data: {
-        settings: getSettings(),
+        settings: await getSettingsPg(),
         keys: Object.keys(DEFAULT_SETTINGS),
       },
     });

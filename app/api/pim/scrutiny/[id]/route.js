@@ -1,7 +1,15 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
+
 const {
-  getScrutinyCase,
-  saveScrutiny,
+  getScrutinyCase, // SQLite version - kept unused by GET as an instant rollback (Batch 5F)
+  saveScrutiny, // SQLite version - kept unused by POST as an instant rollback (Batch 5E)
 } = require("../../../../../lib/pim-scrutiny");
+const {
+  saveScrutinyPg,
+} = require("../../../../../lib/pim-data/scrutiny");
+const {
+  getScrutinyCasePg,
+} = require("../../../../../lib/pim-data/scrutiny-read");
 const {
   requirePermission,
 } = require("../../../../../lib/pim-auth");
@@ -27,7 +35,8 @@ export async function GET(request, context) {
       );
     }
 
-    const data = getScrutinyCase(caseId);
+    // Batch 5F (Phase 6): migrated to PostgreSQL via lib/pim-data/scrutiny-read.js.
+    const data = await getScrutinyCasePg(caseId);
 
     return Response.json({
       success: true,
@@ -74,7 +83,8 @@ export async function POST(request, context) {
 
     const body = await request.json();
 
-    const result = saveScrutiny(
+    // Batch 5E (Phase 6): migrated to PostgreSQL via lib/pim-data/scrutiny.js.
+    const result = await saveScrutinyPg(
       caseId,
       body,
       user.id

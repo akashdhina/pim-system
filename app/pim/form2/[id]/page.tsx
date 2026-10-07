@@ -133,6 +133,12 @@ export default function Form2Page() {
   const [remarks, setRemarks] =
     useState("");
 
+  const [contactAffidavitReceived, setContactAffidavitReceived] =
+    useState(false);
+
+  const [contactAffidavitDate, setContactAffidavitDate] =
+    useState("");
+
   const [dispatchMode, setDispatchMode] =
     useState("REGISTERED_POST");
 
@@ -433,6 +439,11 @@ export default function Form2Page() {
             noticeType,
             remarks:
               remarks.trim() || null,
+            contactAffidavitReceived,
+            contactAffidavitDate:
+              contactAffidavitReceived
+                ? contactAffidavitDate || null
+                : null,
           }),
         }
       );
@@ -460,6 +471,8 @@ export default function Form2Page() {
       );
 
       setRemarks("");
+      setContactAffidavitReceived(false);
+      setContactAffidavitDate("");
 
       await loadData();
     } catch (err) {
@@ -1125,6 +1138,55 @@ export default function Form2Page() {
                       className="mt-2 w-full rounded border p-3 text-sm"
                     />
                   </div>
+                </div>
+
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={
+                        contactAffidavitReceived
+                      }
+                      onChange={(event) => {
+                        const checked =
+                          event.target.checked;
+                        setContactAffidavitReceived(
+                          checked
+                        );
+                        if (!checked) {
+                          setContactAffidavitDate(
+                            ""
+                          );
+                        }
+                      }}
+                    />
+                    Applicant&apos;s contact-particulars affidavit received
+                    (SOP clause 5(a))
+                  </label>
+
+                  <p className="mt-1 text-xs text-gray-500">
+                    Confirms the applicant has affirmed the opposite
+                    party&apos;s postal address, phone/mobile number and
+                    email ID used for this notice are correct and have
+                    been in use during the preceding 30 days. Leave
+                    unchecked unless the affidavit has actually been
+                    received for this notice.
+                  </p>
+
+                  {contactAffidavitReceived && (
+                    <input
+                      type="date"
+                      value={
+                        contactAffidavitDate
+                      }
+                      onChange={(event) =>
+                        setContactAffidavitDate(
+                          event.target.value
+                        )
+                      }
+                      className="mt-2 w-full max-w-xs rounded border p-3 text-sm"
+                    />
+                  )}
                 </div>
 
                 <div>

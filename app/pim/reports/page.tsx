@@ -92,7 +92,8 @@ const filterOptions: Record<string, [string, string][]> = {
   status: [
     ["", "All"],
     ["SCRUTINY_PENDING", "Scrutiny pending"],
-    ["SECRETARY_APPROVAL_PENDING", "Secretary approval"],
+    ["PIM_NUMBER_PENDING", "PIM number pending"],
+    ["SECRETARY_APPROVAL_PENDING", "Secretary approval (legacy)"],
     ["FORM2_PENDING", "Form-2 pending"],
     ["SERVICE_PENDING", "Service pending"],
     ["OP_CONSENT_PENDING", "OP consent"],

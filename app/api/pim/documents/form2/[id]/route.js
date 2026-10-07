@@ -8,6 +8,9 @@ const {
 const {
   authErrorResponse,
 } = require("../../../../../../lib/api-response");
+const {
+  generateForm2DocumentPg,
+} = require("../../../../../../lib/pim-data/form2");
 
 export const runtime = "nodejs";
 
@@ -78,6 +81,61 @@ function getNextVersion(noticeId) {
   return row.next_version || 1;
 }
 
+/*
+ * The ORIGINAL SQLite POST body, kept unused as an instant rollback and
+ * as the authentic SQLite baseline for scripts/test-pim-form2-postgres.js.
+ * Not called by POST.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function generateForm2Sqlite(noticeId, { regenerate }, userId) {
+  return db.transaction(() => {
+    const notice = db.prepare(`
+      SELECT * FROM pim_notices WHERE id = ? AND form_no = 'FORM-2'
+    `).get(noticeId);
+
+    if (!notice) {
+      throw new Error("Form-2 notice record was not found.");
+    }
+
+    const linkedDocument = getLinkedDocument(notice);
+
+    if (!regenerate && hasStoredFile(linkedDocument)) {
+      return { reused: true, caseId: notice.case_id, noticeId, document: linkedDocument };
+    }
+
+    const versionNo = getNextVersion(noticeId);
+    const generated = generateForm2Document({ noticeId, versionNo });
+    const currentDocument = getCurrentForm2Document(noticeId);
+
+    if (currentDocument) {
+      db.prepare(`
+        UPDATE pim_documents SET is_current = 0
+        WHERE notice_id = ? AND document_type IN ('FORM_2', 'FORM2') AND is_current = 1
+      `).run(noticeId);
+    }
+
+    const document = db.prepare(`
+      INSERT INTO pim_documents
+        (case_id, notice_id, document_type, document_title, document_date, file_path,
+         generated_by_system, version_no, is_current, remarks, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      notice.case_id, noticeId, "FORM_2", generated.documentTitle, notice.notice_date || today(),
+      generated.filePath, 1, versionNo, 1,
+      linkedDocument && !linkedDocument.file_path
+        ? "Generated Form-2 file for existing empty-path notice document."
+        : regenerate ? "Regenerated official Form-2 notice." : "Generated official Form-2 notice.",
+      userId
+    );
+
+    const documentId = document.lastInsertRowid;
+    db.prepare(`UPDATE pim_notices SET document_id = ? WHERE id = ?`).run(documentId, noticeId);
+    const nextDocument = db.prepare(`SELECT * FROM pim_documents WHERE id = ?`).get(documentId);
+
+    return { reused: false, caseId: notice.case_id, noticeId, document: nextDocument };
+  })();
+}
+
 export async function POST(
   request,
   { params }
@@ -111,115 +169,10 @@ export async function POST(
     const regenerate =
       body.regenerate === true;
 
-    const result = db.transaction(() => {
-      const notice = db.prepare(`
-        SELECT *
-        FROM pim_notices
-        WHERE id = ?
-          AND form_no = 'FORM-2'
-      `).get(noticeId);
-
-      if (!notice) {
-        throw new Error(
-          "Form-2 notice record was not found."
-        );
-      }
-
-      const linkedDocument =
-        getLinkedDocument(notice);
-
-      if (
-        !regenerate &&
-        hasStoredFile(linkedDocument)
-      ) {
-        return {
-          reused: true,
-          caseId: notice.case_id,
-          noticeId,
-          document: linkedDocument,
-        };
-      }
-
-      const versionNo =
-        getNextVersion(noticeId);
-
-      const generated =
-        generateForm2Document({
-          noticeId,
-          versionNo,
-        });
-
-      const currentDocument =
-        getCurrentForm2Document(
-          noticeId
-        );
-
-      if (currentDocument) {
-        db.prepare(`
-          UPDATE pim_documents
-          SET is_current = 0
-          WHERE notice_id = ?
-            AND document_type IN ('FORM_2', 'FORM2')
-            AND is_current = 1
-        `).run(noticeId);
-      }
-
-      const document = db.prepare(`
-        INSERT INTO pim_documents
-        (
-          case_id,
-          notice_id,
-          document_type,
-          document_title,
-          document_date,
-          file_path,
-          generated_by_system,
-          version_no,
-          is_current,
-          remarks,
-          created_by
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        notice.case_id,
-        noticeId,
-        "FORM_2",
-        generated.documentTitle,
-        notice.notice_date || today(),
-        generated.filePath,
-        1,
-        versionNo,
-        1,
-        linkedDocument && !linkedDocument.file_path
-          ? "Generated Form-2 file for existing empty-path notice document."
-          : regenerate
-            ? "Regenerated official Form-2 notice."
-            : "Generated official Form-2 notice.",
-        user.id
-      );
-
-      const documentId =
-        document.lastInsertRowid;
-
-      db.prepare(`
-        UPDATE pim_notices
-        SET document_id = ?
-        WHERE id = ?
-      `).run(documentId, noticeId);
-
-      const nextDocument = db.prepare(`
-        SELECT *
-        FROM pim_documents
-        WHERE id = ?
-      `).get(documentId);
-
-      return {
-        reused: false,
-        caseId: notice.case_id,
-        noticeId,
-        document: nextDocument,
-      };
-    })();
+    // Batch 5I (Phase 6): migrated to PostgreSQL via lib/pim-data/form2.js.
+    // No-Storage model: file_path is always null for the returned
+    // document; the DOCX is never written to disk here.
+    const result = await generateForm2DocumentPg(noticeId, { regenerate }, user.id);
 
     return Response.json({
       success: true,

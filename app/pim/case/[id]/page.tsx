@@ -327,15 +327,20 @@ function workflowStages(data: Data) {
       status: stageStatus(
         data,
         ["SCRUTINY_PENDING", "DEFECT_PENDING"],
-        doneTasks.has("SCRUTINY") || statusCodes.has("SECRETARY_APPROVAL_PENDING")
+        doneTasks.has("SCRUTINY") ||
+          statusCodes.has("PIM_NUMBER_PENDING") ||
+          statusCodes.has("SECRETARY_APPROVAL_PENDING") // legacy-imported cases only
       ),
       note: taskCodes.has("SCRUTINY") ? "Task recorded" : "Awaiting task",
     },
     {
-      label: "Secretary Approval",
+      // Batch 5H-b: PIM-number assignment (staff-operated) replaces
+      // Secretary approval as this checkpoint - a legacy-imported case may
+      // still show SECRETARY_APPROVAL_PENDING here historically.
+      label: "PIM Number Assignment",
       status: stageStatus(
         data,
-        ["SECRETARY_APPROVAL_PENDING"],
+        ["PIM_NUMBER_PENDING", "SECRETARY_APPROVAL_PENDING"],
         Boolean(c.registration_date) || statusCodes.has("REGISTERED")
       ),
       note: date(c.registration_date),

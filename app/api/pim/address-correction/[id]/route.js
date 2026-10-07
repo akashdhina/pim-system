@@ -13,6 +13,11 @@ const {
 const {
   createFreshInitialNotice,
 } = require("../../../../../lib/pim-fresh-notice");
+const {
+  getAddressCorrectionDataPg,
+  recordCorrectedAddressPg,
+  recordNoCorrectedAddressPg,
+} = require("../../../../../lib/pim-data/service");
 
 function today() {
   return officeDate();
@@ -31,12 +36,16 @@ function getStatusId(code) {
 }
 
 /*
- * NO_CORRECTED_ADDRESS has no existing seeded docket event -
+ * NO_CORRECTED_ADDRESS has no existing seeded docket event in SQLite -
  * the seeded set (ADDRESS_REQUESTED, CORRECTED_ADDRESS_RECEIVED,
  * FRESH_FORM2, FINAL_NOTICE, ...) covers every other Phase 2
- * transition. This additive, idempotent insert is master data,
- * not a schema change.
+ * transition. This additive, idempotent insert is master data, not a
+ * schema change. The PostgreSQL side (lib/pim-data/service.js) does
+ * not need this - Batch 5J pre-seeded the same event as a proper
+ * migration row instead, matching every other event_types row's
+ * convention (see docs/phase6-batch5j-form2-service-migration.md).
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function ensureNoCorrectedAddressEventType() {
   db.prepare(`
     INSERT OR IGNORE INTO event_types (code, name, category)
@@ -152,19 +161,7 @@ function getCase(caseId) {
     .get(caseId);
 }
 
-/*
- * Candidate returned notices for this case that have not yet
- * been resolved by a corrected-address/no-address decision.
- *
- * A returned notice is considered resolved once a later
- * FORM_2_INITIAL notice exists for the same recipient party
- * (the fresh notice created by CORRECTED_ADDRESS_RECEIVED), or
- * once the case has moved past ADDRESS_CORRECTION_PENDING.
- *
- * Multi-OP safety: this never silently picks "the latest"
- * notice when more than one candidate remains - callers of the
- * mutating endpoint below must pass an explicit serviceAttemptId.
- */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getCandidateServiceAttempts(caseId) {
   return db
     .prepare(`
@@ -198,6 +195,7 @@ function getCandidateServiceAttempts(caseId) {
     .all(caseId);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getRecipientAddresses(partyId) {
   return db
     .prepare(`
@@ -223,30 +221,19 @@ export async function GET(request, { params }) {
       );
     }
 
-    const caseData = getCase(caseId);
+    // Batch 5J (Phase 6): migrated to PostgreSQL via lib/pim-data/service.js.
+    const data = await getAddressCorrectionDataPg(caseId);
 
-    if (!caseData) {
+    if (!data) {
       return Response.json(
         { success: false, message: "PIM case not found." },
         { status: 404 }
       );
     }
 
-    const candidates = getCandidateServiceAttempts(caseId);
-
-    const candidatesWithAddresses = candidates.map((candidate) => ({
-      ...candidate,
-      recipientAddresses: getRecipientAddresses(
-        candidate.recipient_party_id
-      ),
-    }));
-
     return Response.json({
       success: true,
-      data: {
-        case: caseData,
-        candidates: candidatesWithAddresses,
-      },
+      data,
     });
   } catch (error) {
     console.error("Address correction GET error:", error);
@@ -309,11 +296,9 @@ export async function POST(request, { params }) {
     }
 
     if (decision === "CORRECTED_ADDRESS_RECEIVED") {
-      ensureNoCorrectedAddressEventType();
-      return handleCorrectedAddressReceived(request, user, caseId, serviceAttemptId, body);
+      return handleCorrectedAddressReceived(user, caseId, serviceAttemptId, body);
     }
 
-    ensureNoCorrectedAddressEventType();
     return handleNoCorrectedAddress(user, caseId, serviceAttemptId, body);
   } catch (error) {
     console.error("Address correction POST error:", error);
@@ -334,6 +319,10 @@ export async function POST(request, { params }) {
   }
 }
 
+/*
+ * The ORIGINAL SQLite attempt loader, kept unused as an instant
+ * rollback / authentic baseline for scripts/test-pim-service-postgres.js.
+ */
 function loadAttemptForCorrection(caseId, serviceAttemptId) {
   return db
     .prepare(`
@@ -353,7 +342,12 @@ function loadAttemptForCorrection(caseId, serviceAttemptId) {
     .get(serviceAttemptId, caseId);
 }
 
-function handleCorrectedAddressReceived(request, user, caseId, serviceAttemptId, body) {
+/*
+ * The ORIGINAL SQLite CORRECTED_ADDRESS_RECEIVED handler, kept unused
+ * as an instant rollback / authentic baseline. Not called by POST.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function handleCorrectedAddressReceivedSqlite(user, caseId, serviceAttemptId, body) {
   const partyId = Number(body.partyId);
 
   const addressLine1 = String(body.addressLine1 || "").trim();
@@ -431,10 +425,6 @@ function handleCorrectedAddressReceived(request, user, caseId, serviceAttemptId,
 
     const pendingTask = getPendingAddressCorrectionTask(caseId);
 
-    /*
-     * Preserve address history: flip only the previously current
-     * address(es) of the same type for this party, never delete.
-     */
     db.prepare(`
       UPDATE pim_addresses
       SET is_current = 0
@@ -534,7 +524,77 @@ function handleCorrectedAddressReceived(request, user, caseId, serviceAttemptId,
   });
 }
 
-function handleNoCorrectedAddress(user, caseId, serviceAttemptId, body) {
+async function handleCorrectedAddressReceived(user, caseId, serviceAttemptId, body) {
+  const partyId = Number(body.partyId);
+
+  const addressLine1 = String(body.addressLine1 || "").trim();
+  const addressLine2 = body.addressLine2 ? String(body.addressLine2).trim() : null;
+  const villageTown = body.villageTown ? String(body.villageTown).trim() : null;
+  const district = body.district ? String(body.district).trim() : null;
+  const state = body.state ? String(body.state).trim() : null;
+  const pincode = body.pincode ? String(body.pincode).trim() : null;
+  const addressType = body.addressType ? String(body.addressType).trim() : "POSTAL";
+
+  const appearanceDate = String(body.appearanceDate || "").trim();
+  const appearanceTime = String(body.appearanceTime || "").trim();
+  const remarks = body.remarks ? String(body.remarks).trim() : null;
+
+  if (!Number.isInteger(partyId) || partyId <= 0) {
+    return Response.json(
+      { success: false, message: "Opposite party identification is required." },
+      { status: 400 }
+    );
+  }
+
+  if (!addressLine1) {
+    return Response.json(
+      { success: false, message: "Corrected address line 1 is required." },
+      { status: 400 }
+    );
+  }
+
+  if (!appearanceDate) {
+    return Response.json(
+      { success: false, message: "Appearance date for the fresh notice is required." },
+      { status: 400 }
+    );
+  }
+
+  if (!appearanceTime) {
+    return Response.json(
+      { success: false, message: "Appearance time for the fresh notice is required." },
+      { status: 400 }
+    );
+  }
+
+  // Batch 5J (Phase 6): migrated to PostgreSQL via lib/pim-data/service.js.
+  // Reuses lib/pim-data/form2.js's createFreshNoticeTx (Batch 5I) rather
+  // than duplicating fresh-notice creation.
+  const result = await recordCorrectedAddressPg(caseId, {
+    serviceAttemptId, partyId, addressLine1, addressLine2, villageTown,
+    district, state, pincode, addressType, appearanceDate, appearanceTime, remarks,
+  }, user.id);
+
+  if (result.conflict) {
+    return Response.json(
+      { success: false, message: result.message },
+      { status: 409 }
+    );
+  }
+
+  return Response.json({
+    success: true,
+    message: "Corrected address recorded and fresh Initial Form-2 notice prepared.",
+    data: result,
+  });
+}
+
+/*
+ * The ORIGINAL SQLite NO_CORRECTED_ADDRESS handler, kept unused as an
+ * instant rollback / authentic baseline. Not called by POST.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function handleNoCorrectedAddressSqlite(user, caseId, serviceAttemptId, body) {
   const confirmed = Boolean(body.confirmed);
   const remarks = body.remarks ? String(body.remarks).trim() : null;
 
@@ -630,6 +690,51 @@ function handleNoCorrectedAddress(user, caseId, serviceAttemptId, body) {
       caseStatus: "FINAL_NOTICE_PENDING",
     };
   })();
+
+  if (result.conflict) {
+    return Response.json(
+      { success: false, message: result.message },
+      { status: 409 }
+    );
+  }
+
+  return Response.json({
+    success: true,
+    message: "Recorded: no corrected address available. Routed to Final Notice follow-up.",
+    data: result,
+  });
+}
+
+async function handleNoCorrectedAddress(user, caseId, serviceAttemptId, body) {
+  const confirmed = Boolean(body.confirmed);
+  const remarks = body.remarks ? String(body.remarks).trim() : null;
+
+  if (!confirmed) {
+    return Response.json(
+      {
+        success: false,
+        message: "Explicit staff confirmation is required to proceed without a corrected address.",
+      },
+      { status: 400 }
+    );
+  }
+
+  if (!remarks) {
+    return Response.json(
+      {
+        success: false,
+        message: "Remarks are required when no corrected address is available.",
+      },
+      { status: 400 }
+    );
+  }
+
+  // Batch 5J (Phase 6): migrated to PostgreSQL via lib/pim-data/service.js.
+  const result = await recordNoCorrectedAddressPg(
+    caseId,
+    { serviceAttemptId, remarks },
+    user.id
+  );
 
   if (result.conflict) {
     return Response.json(

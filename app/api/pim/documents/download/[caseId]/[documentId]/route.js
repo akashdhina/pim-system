@@ -7,6 +7,15 @@ const {
 const {
   authErrorResponse,
 } = require("../../../../../../../lib/api-response");
+const {
+  downloadForm2DocumentPg,
+} = require("../../../../../../../lib/pim-data/form2");
+const {
+  downloadOutcomeDocumentPg,
+} = require("../../../../../../../lib/pim-data/outcome-documents");
+const {
+  downloadForm3DocumentPg,
+} = require("../../../../../../../lib/pim-data/form3-documents");
 
 export const runtime = "nodejs";
 
@@ -56,6 +65,44 @@ export async function GET(
         },
         { status: 400 }
       );
+    }
+
+    /*
+     * Batch 5I (Phase 6): the PostgreSQL no-Storage Form-2 path, tried
+     * first. Renders on demand from the document's frozen render_data
+     * snapshot - never file_path, never a filesystem read. Returns null
+     * (not a throw) for any id this path doesn't own - a Form-3/4/5
+     * document, a SQLite-only document, or a genuinely missing one - so
+     * the original SQLite/local-file logic below still handles every
+     * document type this batch does not touch, unchanged.
+     */
+    const pgResult =
+      (await downloadForm2DocumentPg(caseId, documentId)) ||
+      (await downloadOutcomeDocumentPg(caseId, documentId)) ||
+      (await downloadForm3DocumentPg(caseId, documentId));
+
+    if (pgResult) {
+      if (!pgResult.buffer) {
+        return Response.json(
+          {
+            success: false,
+            message: "Document does not have stored render data.",
+          },
+          { status: 404 }
+        );
+      }
+
+      return new Response(pgResult.buffer, {
+        status: 200,
+        headers: {
+          "Content-Type":
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "Content-Disposition":
+            `attachment; filename="${pgResult.fileName}"`,
+          "Content-Length": String(pgResult.buffer.length),
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
     }
 
     const document = db.prepare(`

@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
 
 const {
-  createReceivedPimApplication,
+  createReceivedPimApplication, // SQLite version - kept unused by POST as an instant rollback (Batch 5C)
 } = require("../../../../lib/pim");
+const {
+  createReceivedPimApplicationPg,
+} = require("../../../../lib/pim-data/intake");
 const {
   requirePermission,
 } = require("../../../../lib/pim-auth");
@@ -19,7 +22,8 @@ export async function POST(request) {
 
     const data = await request.json();
 
-    const caseId = createReceivedPimApplication(
+    // Batch 5C (Phase 6): migrated to PostgreSQL via lib/pim-data/intake.js.
+    const caseId = await createReceivedPimApplicationPg(
       data,
       user.id
     );

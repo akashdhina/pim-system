@@ -4,9 +4,12 @@ const {
   requirePermission,
 } = require("../../../../../lib/pim-auth");
 const {
-  getUser,
+  getUser, // SQLite version - kept unused by GET as an instant rollback (Batch 4)
   updateUser,
 } = require("../../../../../lib/pim-users");
+const {
+  getUser: getUserPg,
+} = require("../../../../../lib/pim-data/users");
 const {
   authErrorResponse,
 } = require("../../../../../lib/api-response");
@@ -24,7 +27,8 @@ function parseId(params) {
 export async function GET(request, { params }) {
   try {
     requirePermission(request, "VIEW_USERS");
-    const user = getUser(parseId(params));
+    // Batch 4 (Phase 6): migrated to PostgreSQL via lib/pim-data/users.js.
+    const user = await getUserPg(parseId(params));
 
     return Response.json({
       success: true,

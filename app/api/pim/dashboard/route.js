@@ -17,7 +17,16 @@ const {
 const {
   listBackups,
 } = require("../../../../lib/pim-backup");
+const {
+  getDashboard,
+} = require("../../../../lib/pim-data/dashboard");
 
+/*
+ * Batch 3 (Phase 6): GET below now calls lib/pim-data/dashboard.js
+ * (PostgreSQL). Everything below is kept, unused by GET, purely as an
+ * instant rollback - see app/api/pim/mediators/route.js for the pattern
+ * established in Batch 1.
+ */
 function today() {
   return officeDate();
 }
@@ -30,6 +39,44 @@ function withAction(row) {
 }
 
 export async function GET(request) {
+  try {
+    requirePermission(request, "READ_CASE");
+
+    // Batch 3 (Phase 6): migrated to PostgreSQL via lib/pim-data/dashboard.js.
+    // The permission check above is unchanged - still the SQLite-backed
+    // lib/pim-auth.js session/user resolution, run before any data access.
+    const data = await getDashboard();
+
+    return Response.json({
+      success: true,
+      data,
+    });
+  } catch (error) {
+    const authResponse = authErrorResponse(error);
+
+    if (authResponse) {
+      return authResponse;
+    }
+
+    console.error("PIM dashboard error:", error);
+
+    return Response.json(
+      {
+        success: false,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to load PIM dashboard.",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+ * Kept below, unused, as the SQLite rollback path for GET (Batch 3).
+ */
+async function sqliteGetDashboardRollbackReference(request) {
   try {
     requirePermission(request, "READ_CASE");
 

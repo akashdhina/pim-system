@@ -13,6 +13,11 @@ const {
 const {
   createNonStarterHandoff,
 } = require("../../../../../lib/pim-op-response");
+const {
+  getServiceDataPg,
+  recordServiceResultPg,
+  ALLOWED_RETURN_REASONS,
+} = require("../../../../../lib/pim-data/service");
 
 function today() {
   return officeDate();
@@ -104,14 +109,6 @@ function addDocket(
   );
 }
 
-const ALLOWED_RETURN_REASONS = [
-  "ADDRESSEE_LEFT",
-  "INSUFFICIENT_ADDRESS",
-  "UNCLAIMED",
-  "REFUSED_BY_ADDRESSEE",
-  "OTHER",
-];
-
 const ADDRESS_CORRECTION_REASONS = new Set([
   "ADDRESSEE_LEFT",
   "INSUFFICIENT_ADDRESS",
@@ -196,6 +193,7 @@ function getCase(caseId) {
     .get(caseId);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getServiceAttempts(caseId) {
   return db
     .prepare(`
@@ -228,6 +226,7 @@ function getServiceAttempts(caseId) {
     .all(caseId);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getNotices(caseId) {
   return db
     .prepare(`
@@ -266,9 +265,10 @@ export async function GET(
       );
     }
 
-    const caseData = getCase(caseId);
+    // Batch 5J (Phase 6): migrated to PostgreSQL via lib/pim-data/service.js.
+    const data = await getServiceDataPg(caseId);
 
-    if (!caseData) {
+    if (!data) {
       return Response.json(
         {
           success: false,
@@ -280,12 +280,7 @@ export async function GET(
 
     return Response.json({
       success: true,
-      data: {
-        case: caseData,
-        notices: getNotices(caseId),
-        serviceAttempts:
-          getServiceAttempts(caseId),
-      },
+      data,
     });
   } catch (error) {
     console.error(
@@ -307,6 +302,210 @@ export async function GET(
       { status: 500 }
     );
   }
+}
+
+/*
+ * The ORIGINAL SQLite POST body, kept unused as an instant rollback and
+ * as the authentic SQLite baseline for scripts/test-pim-service-postgres.js
+ * (same convention as every prior batch's kept -Sqlite function). Not
+ * called by POST. Pre-existing behavior preserved verbatim, INCLUDING
+ * the latent inconsistency Batch 5J's audit identified and the approved
+ * plan deliberately corrected in the PostgreSQL path only (a returned
+ * Final Notice here never updates pim_cases.current_status_id to
+ * NOTICE_RETURNED - see lib/pim-data/service.js's own comment for the
+ * intentional correction).
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function recordServiceResultSqlite(caseId, {
+  serviceAttemptId, result, trackingStatus, postalEndorsement,
+  deliveredDate, returnedDate, remarks, returnReason, administrativeAction,
+}, userId) {
+  return db.transaction(() => {
+    const caseData = getCase(caseId);
+
+    if (!caseData) {
+      throw new Error("PIM case not found.");
+    }
+
+    if (caseData.status_code !== "SERVICE_PENDING") {
+      return {
+        conflict: true,
+        message: `This case is not available for service tracking. Current status: ${caseData.status_name}`,
+      };
+    }
+
+    const attempt = db.prepare(`
+      SELECT
+        sa.*,
+        n.id AS notice_id,
+        n.status AS notice_status,
+        n.notice_type,
+        n.recipient_party_id,
+        p.name AS recipient_name
+      FROM pim_service_attempts sa
+      JOIN pim_notices n ON n.id = sa.notice_id
+      LEFT JOIN pim_parties p ON p.id = n.recipient_party_id
+      WHERE sa.id = ? AND n.case_id = ?
+    `).get(serviceAttemptId, caseId);
+
+    if (!attempt) {
+      throw new Error("Service attempt not found for this case.");
+    }
+
+    if (attempt.notice_status !== "DISPATCHED") {
+      return {
+        conflict: true,
+        message: `This notice is not available for service tracking. Current notice status: ${attempt.notice_status}`,
+      };
+    }
+
+    if (result === "DELIVERED" && !deliveredDate) {
+      throw new Error("Delivered date is required.");
+    }
+
+    if (result === "RETURNED" && !returnedDate) {
+      throw new Error("Returned date is required.");
+    }
+
+    db.prepare(`
+      UPDATE pim_service_attempts
+      SET
+        tracking_status = ?,
+        postal_endorsement = ?,
+        return_reason = ?,
+        delivered_date = ?,
+        returned_date = ?,
+        remarks = COALESCE(?, remarks)
+      WHERE id = ?
+    `).run(
+      trackingStatus,
+      postalEndorsement,
+      result === "RETURNED" ? returnReason : null,
+      deliveredDate,
+      returnedDate,
+      remarks,
+      serviceAttemptId
+    );
+
+    if (result === "DELIVERED") {
+      db.prepare(`
+        UPDATE pim_notices SET status = 'SERVED' WHERE id = ?
+      `).run(attempt.notice_id);
+
+      addDocket(
+        caseId, "NOTICE_DELIVERED",
+        `Form-2 notice delivered to ${attempt.recipient_name || "opposite party"}.`,
+        "Await opposite party response / appearance", userId
+      );
+
+      return {
+        result, caseId, serviceAttemptId, noticeId: attempt.notice_id,
+        caseStatus: "SERVICE_PENDING", noticeStatus: "SERVED",
+      };
+    }
+
+    if (result === "RETURNED") {
+      const servicePendingStatusId = getStatusId("SERVICE_PENDING");
+      const returnedStatusId = getStatusId("NOTICE_RETURNED");
+
+      db.prepare(`
+        UPDATE pim_notices SET status = 'RETURNED' WHERE id = ?
+      `).run(attempt.notice_id);
+
+      addStatusHistory(
+        caseId, servicePendingStatusId, returnedStatusId,
+        "Form-2 notice returned after service attempt.", userId
+      );
+
+      addDocket(
+        caseId, "NOTICE_RETURNED",
+        `Form-2 notice returned for ${attempt.recipient_name || "opposite party"} (${returnReason}).`,
+        "Address / service correction", userId
+      );
+
+      if (attempt.notice_type === "FORM_2_FINAL") {
+        createNonStarterHandoff(
+          caseId, attempt.recipient_name,
+          `Final Notice returned (${returnReason}); remained unacknowledged.`,
+          userId
+        );
+
+        return {
+          result, caseId, serviceAttemptId, noticeId: attempt.notice_id, returnReason,
+          caseStatus: "SERVICE_PENDING", noticeStatus: "RETURNED",
+        };
+      }
+
+      const seekCorrectedAddress =
+        ADDRESS_CORRECTION_REASONS.has(returnReason) ||
+        (returnReason === "OTHER" && administrativeAction === "SEEK_CORRECTED_ADDRESS");
+
+      const proceedToFinalNotice =
+        FINAL_NOTICE_REASONS.has(returnReason) ||
+        (returnReason === "OTHER" && administrativeAction === "PROCEED_TO_FINAL_NOTICE");
+
+      if (seekCorrectedAddress) {
+        const addressCorrectionStatusId = getStatusId("ADDRESS_CORRECTION_PENDING");
+
+        addStatusHistory(
+          caseId, returnedStatusId, addressCorrectionStatusId,
+          `Corrected address required (${returnReason}).`, userId
+        );
+
+        db.prepare(`
+          UPDATE pim_cases SET current_status_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+        `).run(addressCorrectionStatusId, caseId);
+
+        createPendingTaskIfNotExists(
+          caseId, "ADDRESS_CORRECTION",
+          `Obtain corrected address for ${attempt.recipient_name || "opposite party"}.`,
+          today()
+        );
+
+        addDocket(
+          caseId, "ADDRESS_REQUESTED",
+          `Corrected address requested for ${attempt.recipient_name || "opposite party"}.`,
+          "Obtain corrected address", userId
+        );
+
+        return {
+          result, caseId, serviceAttemptId, noticeId: attempt.notice_id, returnReason,
+          caseStatus: "ADDRESS_CORRECTION_PENDING", noticeStatus: "RETURNED",
+        };
+      }
+
+      if (proceedToFinalNotice) {
+        const finalNoticeStatusId = getStatusId("FINAL_NOTICE_PENDING");
+
+        addStatusHistory(
+          caseId, returnedStatusId, finalNoticeStatusId,
+          `Routed to Final Notice follow-up (${returnReason}).`, userId
+        );
+
+        db.prepare(`
+          UPDATE pim_cases SET current_status_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+        `).run(finalNoticeStatusId, caseId);
+
+        createPendingTaskIfNotExists(
+          caseId, "FINAL_NOTICE_FOLLOWUP",
+          `Final Notice follow-up for ${attempt.recipient_name || "opposite party"}.`,
+          today()
+        );
+
+        return {
+          result, caseId, serviceAttemptId, noticeId: attempt.notice_id, returnReason,
+          caseStatus: "FINAL_NOTICE_PENDING", noticeStatus: "RETURNED",
+        };
+      }
+
+      throw new Error("Unable to determine the administrative branch for this returned notice.");
+    }
+
+    return {
+      result, caseId, serviceAttemptId, noticeId: attempt.notice_id,
+      caseStatus: "SERVICE_PENDING", noticeStatus: "DISPATCHED",
+    };
+  })();
 }
 
 export async function POST(
@@ -423,7 +622,7 @@ export async function POST(
 
     if (result === "RETURNED") {
       if (
-        !ALLOWED_RETURN_REASONS.includes(
+        !ALLOWED_RETURN_REASONS.has(
           returnReason
         )
       ) {
@@ -468,374 +667,11 @@ export async function POST(
       }
     }
 
-    const transaction =
-      db.transaction(() => {
-        const caseData =
-          getCase(caseId);
-
-        if (!caseData) {
-          throw new Error(
-            "PIM case not found."
-          );
-        }
-
-        if (
-          caseData.status_code !==
-          "SERVICE_PENDING"
-        ) {
-          return {
-            conflict: true,
-            message:
-              `This case is not available for service tracking. Current status: ${caseData.status_name}`,
-          };
-        }
-
-        const attempt =
-          db.prepare(`
-            SELECT
-              sa.*,
-              n.id AS notice_id,
-              n.status AS notice_status,
-              n.notice_type,
-              n.recipient_party_id,
-              p.name AS recipient_name
-            FROM pim_service_attempts sa
-            JOIN pim_notices n
-              ON n.id = sa.notice_id
-            LEFT JOIN pim_parties p
-              ON p.id = n.recipient_party_id
-            WHERE sa.id = ?
-              AND n.case_id = ?
-          `).get(
-            serviceAttemptId,
-            caseId
-          );
-
-        if (!attempt) {
-          throw new Error(
-            "Service attempt not found for this case."
-          );
-        }
-
-        if (
-          attempt.notice_status !==
-          "DISPATCHED"
-        ) {
-          return {
-            conflict: true,
-            message:
-              `This notice is not available for service tracking. Current notice status: ${attempt.notice_status}`,
-          };
-        }
-
-        if (
-          result === "DELIVERED" &&
-          !deliveredDate
-        ) {
-          throw new Error(
-            "Delivered date is required."
-          );
-        }
-
-        if (
-          result === "RETURNED" &&
-          !returnedDate
-        ) {
-          throw new Error(
-            "Returned date is required."
-          );
-        }
-
-        /*
-         * Update the existing service attempt.
-         */
-        db.prepare(`
-          UPDATE pim_service_attempts
-          SET
-            tracking_status = ?,
-            postal_endorsement = ?,
-            return_reason = ?,
-            delivered_date = ?,
-            returned_date = ?,
-            remarks = COALESCE(?, remarks)
-          WHERE id = ?
-        `).run(
-          trackingStatus,
-          postalEndorsement,
-          result === "RETURNED"
-            ? returnReason
-            : null,
-          deliveredDate,
-          returnedDate,
-          remarks,
-          serviceAttemptId
-        );
-
-        /*
-         * DELIVERY
-         *
-         * Delivery is recorded as a service fact.
-         * The case remains in SERVICE_PENDING because
-         * the next business step is OP response/appearance.
-         */
-        if (result === "DELIVERED") {
-          db.prepare(`
-            UPDATE pim_notices
-            SET
-              status = 'SERVED'
-            WHERE id = ?
-          `).run(
-            attempt.notice_id
-          );
-
-          addDocket(
-            caseId,
-            "NOTICE_DELIVERED",
-            `Form-2 notice delivered to ${attempt.recipient_name || "opposite party"}.`,
-            "Await opposite party response / appearance",
-            user.id
-          );
-
-          return {
-            result,
-            caseId,
-            serviceAttemptId,
-            noticeId:
-              attempt.notice_id,
-            caseStatus:
-              "SERVICE_PENDING",
-            noticeStatus:
-              "SERVED",
-          };
-        }
-
-        /*
-         * RETURNED
-         *
-         * Do not silently treat a returned notice as
-         * failed service and continue the case.
-         *
-         * The existing workflow has a dedicated
-         * NOTICE_RETURNED stage.
-         */
-        if (result === "RETURNED") {
-          const servicePendingStatusId =
-            getStatusId(
-              "SERVICE_PENDING"
-            );
-
-          const returnedStatusId =
-            getStatusId(
-              "NOTICE_RETURNED"
-            );
-
-          db.prepare(`
-            UPDATE pim_notices
-            SET
-              status = 'RETURNED'
-            WHERE id = ?
-          `).run(
-            attempt.notice_id
-          );
-
-          addStatusHistory(
-            caseId,
-            servicePendingStatusId,
-            returnedStatusId,
-            "Form-2 notice returned after service attempt.",
-            user.id
-          );
-
-          addDocket(
-            caseId,
-            "NOTICE_RETURNED",
-            `Form-2 notice returned for ${attempt.recipient_name || "opposite party"} (${returnReason}).`,
-            "Address / service correction",
-            user.id
-          );
-
-          /*
-           * A returned FINAL notice is never routed back into
-           * address correction / a fresh Final Notice - this IS
-           * already the Final Notice. Preserve the exact postal
-           * return_reason as the service fact (already persisted
-           * above) and hand off to the centralized Non-Starter
-           * workflow (Phase 5) instead. Case status is left
-           * unchanged; the pending NONSTARTER_FORM3 task is the
-           * next-action signal.
-           */
-          if (attempt.notice_type === "FORM_2_FINAL") {
-            createNonStarterHandoff(
-              caseId,
-              attempt.recipient_name,
-              `Final Notice returned (${returnReason}); remained unacknowledged.`,
-              user.id
-            );
-
-            return {
-              result,
-              caseId,
-              serviceAttemptId,
-              noticeId:
-                attempt.notice_id,
-              returnReason,
-              caseStatus:
-                "SERVICE_PENDING",
-              noticeStatus:
-                "RETURNED",
-            };
-          }
-
-          /*
-           * Postal refusal of delivery (REFUSED_BY_ADDRESSEE) is a
-           * service fact about this notice. It is never treated as
-           * OP_REFUSED, which means the opposite party itself
-           * refused to participate in mediation - a separate,
-           * later workflow owned by the OP-response stage.
-           */
-          const seekCorrectedAddress =
-            ADDRESS_CORRECTION_REASONS.has(
-              returnReason
-            ) ||
-            (returnReason === "OTHER" &&
-              administrativeAction ===
-                "SEEK_CORRECTED_ADDRESS");
-
-          const proceedToFinalNotice =
-            FINAL_NOTICE_REASONS.has(
-              returnReason
-            ) ||
-            (returnReason === "OTHER" &&
-              administrativeAction ===
-                "PROCEED_TO_FINAL_NOTICE");
-
-          if (seekCorrectedAddress) {
-            const addressCorrectionStatusId =
-              getStatusId(
-                "ADDRESS_CORRECTION_PENDING"
-              );
-
-            addStatusHistory(
-              caseId,
-              returnedStatusId,
-              addressCorrectionStatusId,
-              `Corrected address required (${returnReason}).`,
-              user.id
-            );
-
-            db.prepare(`
-              UPDATE pim_cases
-              SET
-                current_status_id = ?,
-                updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `).run(
-              addressCorrectionStatusId,
-              caseId
-            );
-
-            createPendingTaskIfNotExists(
-              caseId,
-              "ADDRESS_CORRECTION",
-              `Obtain corrected address for ${attempt.recipient_name || "opposite party"}.`,
-              today()
-            );
-
-            addDocket(
-              caseId,
-              "ADDRESS_REQUESTED",
-              `Corrected address requested for ${attempt.recipient_name || "opposite party"}.`,
-              "Obtain corrected address",
-              user.id
-            );
-
-            return {
-              result,
-              caseId,
-              serviceAttemptId,
-              noticeId:
-                attempt.notice_id,
-              returnReason,
-              caseStatus:
-                "ADDRESS_CORRECTION_PENDING",
-              noticeStatus:
-                "RETURNED",
-            };
-          }
-
-          if (proceedToFinalNotice) {
-            const finalNoticeStatusId =
-              getStatusId(
-                "FINAL_NOTICE_PENDING"
-              );
-
-            addStatusHistory(
-              caseId,
-              returnedStatusId,
-              finalNoticeStatusId,
-              `Routed to Final Notice follow-up (${returnReason}).`,
-              user.id
-            );
-
-            db.prepare(`
-              UPDATE pim_cases
-              SET
-                current_status_id = ?,
-                updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `).run(
-              finalNoticeStatusId,
-              caseId
-            );
-
-            createPendingTaskIfNotExists(
-              caseId,
-              "FINAL_NOTICE_FOLLOWUP",
-              `Final Notice follow-up for ${attempt.recipient_name || "opposite party"}.`,
-              today()
-            );
-
-            return {
-              result,
-              caseId,
-              serviceAttemptId,
-              noticeId:
-                attempt.notice_id,
-              returnReason,
-              caseStatus:
-                "FINAL_NOTICE_PENDING",
-              noticeStatus:
-                "RETURNED",
-            };
-          }
-
-          /*
-           * Should not happen given the validation above, but
-           * never silently leave the case in a status that has
-           * no corresponding pending task.
-           */
-          throw new Error(
-            "Unable to determine the administrative branch for this returned notice."
-          );
-        }
-
-        /*
-         * TRACKING UPDATE
-         *
-         * No workflow status change.
-         */
-        return {
-          result,
-          caseId,
-          serviceAttemptId,
-          noticeId:
-            attempt.notice_id,
-          caseStatus:
-            "SERVICE_PENDING",
-          noticeStatus:
-            "DISPATCHED",
-        };
-      })();
+    // Batch 5J (Phase 6): migrated to PostgreSQL via lib/pim-data/service.js.
+    const transaction = await recordServiceResultPg(caseId, {
+      serviceAttemptId, result, trackingStatus, postalEndorsement,
+      deliveredDate, returnedDate, remarks, returnReason, administrativeAction,
+    }, user.id);
 
     if (transaction.conflict) {
       return Response.json(

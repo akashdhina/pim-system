@@ -7,7 +7,16 @@ const {
 const {
   authErrorResponse,
 } = require("../../../../../lib/api-response");
+const {
+  getCaseDetail,
+} = require("../../../../../lib/pim-data/case-detail");
 
+/*
+ * Batch 2 (Phase 6): GET below now calls lib/pim-data/case-detail.js
+ * (PostgreSQL). The SQLite query functions below are kept, unused by GET,
+ * purely as an instant rollback - see app/api/pim/mediators/route.js for
+ * the same pattern established in Batch 1.
+ */
 function getCase(caseId) {
   return db.prepare(`
     SELECT
@@ -532,9 +541,12 @@ export async function GET(request, { params }) {
       );
     }
 
-    const caseData = getCase(caseId);
+    // Batch 2 (Phase 6): migrated to PostgreSQL via lib/pim-data/case-detail.js.
+    // The permission check above is unchanged - still the SQLite-backed
+    // lib/pim-auth.js session/user resolution, run before any data access.
+    const data = await getCaseDetail(caseId);
 
-    if (!caseData) {
+    if (!data) {
       return Response.json(
         {
           success: false,
@@ -544,53 +556,9 @@ export async function GET(request, { params }) {
       );
     }
 
-    const tasks = getTasks(caseId);
-    const notices = getNotices(caseId);
-    const fees = getFees(caseId);
-    const mediatorAssignments = getMediatorAssignments(caseId);
-    const sessions = getSessions(caseId);
-    const outcome = getOutcome(caseId);
-    const documents = getDocuments(caseId);
-
-    const cumulativeDurationMinutes = sessions.reduce(
-      (total, session) =>
-        session.effective_session &&
-        Number.isFinite(session.duration_minutes)
-          ? total + Number(session.duration_minutes)
-          : total,
-      0
-    );
-
     return Response.json({
       success: true,
-      data: {
-        case: caseData,
-        parties: getParties(caseId),
-        addresses: getAddresses(caseId),
-        advocates: getAdvocates(caseId),
-        statusHistory: getStatusHistory(caseId),
-        docket: getDocket(caseId),
-        tasks,
-        notices,
-        serviceAttempts:
-          getServiceAttempts(caseId),
-        responses: getResponses(caseId),
-        fees,
-        feeSummary: getFeeSummary(fees),
-        mediatorAssignments,
-        sessions,
-        cumulativeDurationMinutes,
-        outcome,
-        documents,
-        warnings: getWarnings(caseId, caseData, {
-          tasks,
-          outcome,
-          documents,
-          mediatorAssignments,
-          sessions,
-          notices,
-        }),
-      },
+      data,
     });
   } catch (error) {
     console.error(

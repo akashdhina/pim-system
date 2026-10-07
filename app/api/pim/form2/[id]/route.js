@@ -8,6 +8,10 @@ const {
 const {
   createFreshNotice,
 } = require("../../../../../lib/pim-fresh-notice");
+const {
+  getForm2DataPg,
+  prepareForm2NoticePg,
+} = require("../../../../../lib/pim-data/form2");
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -28,6 +32,15 @@ function getCase(caseId) {
     .get(caseId);
 }
 
+/*
+ * The ORIGINAL SQLite GET-path helpers below (getOppositeParties,
+ * getFinalNoticeCandidates, getNotices, getForm2Task) are kept unused as
+ * an instant rollback and as the authentic SQLite baseline for
+ * scripts/test-pim-form2-postgres.js. Not called by GET (Batch 5I
+ * migrated it to lib/pim-data/form2.js's getForm2DataPg). getCase stays
+ * in active use below, by the kept prepareForm2Sqlite POST baseline.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getOppositeParties(caseId) {
   const parties = db
     .prepare(`
@@ -99,6 +112,7 @@ function getOppositeParties(caseId) {
  * picks "the latest" when more than one remains; the caller
  * must select one explicitly.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getFinalNoticeCandidates(caseId) {
   return db
     .prepare(`
@@ -132,6 +146,7 @@ function getFinalNoticeCandidates(caseId) {
     .all(caseId);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getNotices(caseId) {
   return db
     .prepare(`
@@ -162,6 +177,7 @@ function getNotices(caseId) {
     .all(caseId);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function getForm2Task(caseId) {
   return db
     .prepare(`
@@ -242,9 +258,10 @@ export async function GET(request, { params }) {
       );
     }
 
-    const caseData = getCase(caseId);
+    // Batch 5I (Phase 6): migrated to PostgreSQL via lib/pim-data/form2.js.
+    const data = await getForm2DataPg(caseId);
 
-    if (!caseData) {
+    if (!data) {
       return Response.json(
         {
           success: false,
@@ -254,29 +271,9 @@ export async function GET(request, { params }) {
       );
     }
 
-    const parties =
-      getOppositeParties(caseId);
-
-    const notices =
-      getNotices(caseId);
-
-    const task =
-      getForm2Task(caseId);
-
-    const finalNoticeCandidates =
-      caseData.status_code === "FINAL_NOTICE_PENDING"
-        ? getFinalNoticeCandidates(caseId)
-        : [];
-
     return Response.json({
       success: true,
-      data: {
-        case: caseData,
-        oppositeParties: parties,
-        notices,
-        task: task || null,
-        finalNoticeCandidates,
-      },
+      data,
     });
   } catch (error) {
     console.error(
@@ -298,6 +295,100 @@ export async function GET(request, { params }) {
       { status: 500 }
     );
   }
+}
+
+/*
+ * The ORIGINAL SQLite POST body, kept unused as an instant rollback and
+ * as the authentic SQLite baseline for scripts/test-pim-form2-postgres.js
+ * (same convention as every prior batch's kept -Sqlite function). Not
+ * called by POST.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function prepareForm2Sqlite(caseId, { partyId, addressId, appearanceDate, appearanceTime, noticeType, remarks }, userId) {
+  return db.transaction(() => {
+    const caseData = getCase(caseId);
+
+    if (!caseData) {
+      throw new Error("PIM case not found.");
+    }
+
+    const expectedStatus = noticeType === "FORM_2_FINAL" ? "FINAL_NOTICE_PENDING" : "FORM2_PENDING";
+
+    if (caseData.status_code !== expectedStatus) {
+      throw new Error(
+        noticeType === "FORM_2_FINAL"
+          ? `This case is not available for Final Notice preparation. Current status: ${caseData.status_name}`
+          : `This case is not available for Form-2 preparation. Current status: ${caseData.status_name}`
+      );
+    }
+
+    const party = db.prepare(`
+      SELECT cp.party_id, cp.role, p.name
+      FROM pim_case_parties cp
+      JOIN pim_parties p ON p.id = cp.party_id
+      WHERE cp.case_id = ? AND cp.party_id = ? AND cp.role = 'OPPOSITE_PARTY' AND cp.active_to IS NULL
+    `).get(caseId, partyId);
+
+    if (!party) {
+      throw new Error("Selected party is not an active opposite party in this case.");
+    }
+
+    const address =
+      noticeType === "FORM_2_FINAL"
+        ? db.prepare(`SELECT * FROM pim_addresses WHERE id = ? AND party_id = ?`).get(addressId, partyId)
+        : db.prepare(`SELECT * FROM pim_addresses WHERE id = ? AND party_id = ? AND is_current = 1`).get(addressId, partyId);
+
+    if (!address) {
+      throw new Error(
+        noticeType === "FORM_2_FINAL"
+          ? "Selected address does not belong to this opposite party."
+          : "Selected address is not a current address of the opposite party."
+      );
+    }
+
+    const existing = db.prepare(`
+      SELECT id FROM pim_notices
+      WHERE case_id = ? AND recipient_party_id = ? AND notice_type = ?
+        AND status IN ('PREPARED', 'SIGNED', 'DISPATCHED')
+      LIMIT 1
+    `).get(caseId, partyId, noticeType);
+
+    if (existing) {
+      throw new Error(
+        noticeType === "FORM_2_FINAL"
+          ? "A Final Notice for this opposite party already exists."
+          : "A Form-2 notice for this opposite party already exists."
+      );
+    }
+
+    let noticeId;
+
+    if (noticeType === "FORM_2_FINAL") {
+      noticeId = createFreshNotice({
+        caseId, recipientPartyId: partyId, addressId, noticeType: "FORM_2_FINAL",
+        noticeDate: today(), appearanceDate, appearanceTime, preparedBy: userId, remarks: remarks || null,
+      });
+    } else {
+      const notice = db.prepare(`
+        INSERT INTO pim_notices
+          (case_id, notice_type, form_no, notice_date, appearance_date, appearance_time,
+           recipient_party_id, address_id, prepared_by, status, remarks)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(caseId, noticeType, "FORM-2", today(), appearanceDate, appearanceTime, partyId, addressId, userId, "PREPARED", remarks || null);
+
+      noticeId = Number(notice.lastInsertRowid);
+    }
+
+    addDocket(
+      caseId, "FORM2_PREPARED",
+      noticeType === "FORM_2_FINAL"
+        ? `Final Form-2 notice prepared for opposite party ${party.name}.`
+        : `Form-2 prepared for opposite party ${party.name}.`,
+      "Form-2 issue / dispatch", null, userId
+    );
+
+    return { noticeId, caseId, partyId, addressId, appearanceDate, appearanceTime, noticeType, status: "PREPARED" };
+  })();
 }
 
 export async function POST(request, { params }) {
@@ -395,190 +486,16 @@ export async function POST(request, { params }) {
       );
     }
 
-    const result = db.transaction(() => {
-      const caseData =
-        getCase(caseId);
-
-      if (!caseData) {
-        throw new Error(
-          "PIM case not found."
-        );
-      }
-
-      const expectedStatus =
-        noticeType === "FORM_2_FINAL"
-          ? "FINAL_NOTICE_PENDING"
-          : "FORM2_PENDING";
-
-      if (
-        caseData.status_code !==
-        expectedStatus
-      ) {
-        throw new Error(
-          noticeType === "FORM_2_FINAL"
-            ? `This case is not available for Final Notice preparation. Current status: ${caseData.status_name}`
-            : `This case is not available for Form-2 preparation. Current status: ${caseData.status_name}`
-        );
-      }
-
-      const party =
-        db.prepare(`
-          SELECT
-            cp.party_id,
-            cp.role,
-            p.name
-          FROM pim_case_parties cp
-          JOIN pim_parties p
-            ON p.id = cp.party_id
-          WHERE cp.case_id = ?
-            AND cp.party_id = ?
-            AND cp.role = 'OPPOSITE_PARTY'
-            AND cp.active_to IS NULL
-        `).get(
-          caseId,
-          partyId
-        );
-
-      if (!party) {
-        throw new Error(
-          "Selected party is not an active opposite party in this case."
-        );
-      }
-
-      /*
-       * Initial notices must use a current address. A Final
-       * Notice may deliberately reuse the exact (possibly since-
-       * superseded) address the returned notice was sent to, so
-       * that path allows any address on record for this party.
-       */
-      const address =
-        noticeType === "FORM_2_FINAL"
-          ? db.prepare(`
-              SELECT *
-              FROM pim_addresses
-              WHERE id = ?
-                AND party_id = ?
-            `).get(addressId, partyId)
-          : db.prepare(`
-              SELECT *
-              FROM pim_addresses
-              WHERE id = ?
-                AND party_id = ?
-                AND is_current = 1
-            `).get(addressId, partyId);
-
-      if (!address) {
-        throw new Error(
-          noticeType === "FORM_2_FINAL"
-            ? "Selected address does not belong to this opposite party."
-            : "Selected address is not a current address of the opposite party."
-        );
-      }
-
-      const existing =
-        db.prepare(`
-          SELECT id
-          FROM pim_notices
-          WHERE case_id = ?
-            AND recipient_party_id = ?
-            AND notice_type = ?
-            AND status IN (
-              'PREPARED',
-              'SIGNED',
-              'DISPATCHED'
-            )
-          LIMIT 1
-        `).get(
-          caseId,
-          partyId,
-          noticeType
-        );
-
-      if (existing) {
-        throw new Error(
-          noticeType === "FORM_2_FINAL"
-            ? "A Final Notice for this opposite party already exists."
-            : "A Form-2 notice for this opposite party already exists."
-        );
-      }
-
-      let noticeId;
-
-      if (noticeType === "FORM_2_FINAL") {
-        /*
-         * Reuses the same safe notice-instance model as the
-         * Phase 2 fresh-Initial-notice flow: new pim_notices
-         * row, own address_id, duplicate-guard, and the ≤10-day
-         * appearance-date window.
-         */
-        noticeId = createFreshNotice({
-          caseId,
-          recipientPartyId: partyId,
-          addressId,
-          noticeType: "FORM_2_FINAL",
-          noticeDate: today(),
-          appearanceDate,
-          appearanceTime,
-          preparedBy: user.id,
-          remarks: body.remarks || null,
-        });
-      } else {
-        const notice =
-          db.prepare(`
-            INSERT INTO pim_notices
-            (
-              case_id,
-              notice_type,
-              form_no,
-              notice_date,
-              appearance_date,
-              appearance_time,
-              recipient_party_id,
-              address_id,
-              prepared_by,
-              status,
-              remarks
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            caseId,
-            noticeType,
-            "FORM-2",
-            today(),
-            appearanceDate,
-            appearanceTime,
-            partyId,
-            addressId,
-            user.id,
-            "PREPARED",
-            body.remarks || null
-          );
-
-        noticeId = Number(notice.lastInsertRowid);
-      }
-
-      addDocket(
-        caseId,
-        "FORM2_PREPARED",
-        noticeType === "FORM_2_FINAL"
-          ? `Final Form-2 notice prepared for opposite party ${party.name}.`
-          : `Form-2 prepared for opposite party ${party.name}.`,
-        "Form-2 issue / dispatch",
-        null,
-        user.id
-      );
-
-      return {
-        noticeId,
-        caseId,
-        partyId,
-        addressId,
-        appearanceDate,
-        appearanceTime,
-        noticeType,
-        status: "PREPARED",
-      };
-    })();
+    // Batch 5I (Phase 6): migrated to PostgreSQL via lib/pim-data/form2.js.
+    // Batch 5J: SOP clause 5(a) contact-particulars affidavit, captured
+    // at Prepare time (see lib/pim-data/form2.js's resolveContactAffidavit
+    // for the enforced invariant - never silently defaulted to received).
+    const result = await prepareForm2NoticePg(caseId, {
+      partyId, addressId, appearanceDate, appearanceTime, noticeType,
+      remarks: body.remarks || null,
+      contactAffidavitReceived: body.contactAffidavitReceived === true,
+      contactAffidavitDate: body.contactAffidavitDate || null,
+    }, user.id);
 
     return Response.json({
       success: true,
